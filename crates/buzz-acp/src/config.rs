@@ -30,6 +30,9 @@ pub(crate) const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 900;
 /// Override via `--max-turn-duration` / `BUZZ_ACP_MAX_TURN_DURATION`.
 pub(crate) const DEFAULT_MAX_TURN_DURATION_SECS: u64 = 7200;
 
+/// Default delay before checking whether a mention-triggered turn posted.
+pub(crate) const DEFAULT_SILENT_TURN_GRACE_SECS: u64 = 10;
+
 /// Upper bound for `max_turn_duration` (7 days). Any higher is operationally
 /// meaningless and risks arithmetic overflow when deriving the in-flight
 /// deadline (`max_turn_duration + IN_FLIGHT_DEADLINE_BUFFER_SECS`).
@@ -308,6 +311,24 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_TURN_LIVENESS_SECS", default_value_t = 10)]
     pub turn_liveness_secs: u64,
 
+    /// Re-prompt a mention-triggered ACP turn once when it ends without a
+    /// self-authored channel post.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_SILENT_TURN_CONTINUATION",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    pub silent_turn_continuation: bool,
+
+    /// Seconds to allow relay persistence/echo before checking for a post.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_SILENT_TURN_GRACE_SECS",
+        default_value_t = DEFAULT_SILENT_TURN_GRACE_SECS
+    )]
+    pub silent_turn_grace_secs: u64,
+
     /// Heartbeat prompt text. Conflicts with --heartbeat-prompt-file.
     #[arg(
         long,
@@ -529,6 +550,10 @@ pub struct Config {
     /// `heartbeat_interval_secs` (agent self-prompting) — this is the desktop
     /// crash-backstop signal.
     pub turn_liveness_secs: u64,
+    /// Whether mention-triggered silent turns receive one bounded continuation.
+    pub silent_turn_continuation: bool,
+    /// Grace before the authored-post query runs.
+    pub silent_turn_grace_secs: u64,
     pub heartbeat_prompt: Option<String>,
     pub system_prompt: Option<String>,
     /// Team-owned instructions layered separately from the agent system prompt.
@@ -1102,6 +1127,8 @@ impl Config {
             agents: args.agents,
             heartbeat_interval_secs: heartbeat_interval,
             turn_liveness_secs,
+            silent_turn_continuation: args.silent_turn_continuation,
+            silent_turn_grace_secs: args.silent_turn_grace_secs,
             heartbeat_prompt,
             system_prompt,
             team_instructions: args
@@ -1483,6 +1510,8 @@ mod tests {
             agents: 1,
             heartbeat_interval_secs: 0,
             turn_liveness_secs: 10,
+            silent_turn_continuation: true,
+            silent_turn_grace_secs: DEFAULT_SILENT_TURN_GRACE_SECS,
             heartbeat_prompt: None,
             system_prompt: None,
             team_instructions: None,
@@ -2247,6 +2276,28 @@ channels = "ALL"
             "300",
         ]);
         assert_eq!(configured.idle_pool_sleep, 300);
+    }
+
+    #[test]
+    fn silent_turn_knobs_default_on_and_accept_cli_values() {
+        let key = "0".repeat(64);
+        let defaults = CliArgs::parse_from(["buzz-acp", "--private-key", &key]);
+        assert!(defaults.silent_turn_continuation);
+        assert_eq!(
+            defaults.silent_turn_grace_secs,
+            DEFAULT_SILENT_TURN_GRACE_SECS
+        );
+
+        let configured = CliArgs::parse_from([
+            "buzz-acp",
+            "--private-key",
+            &key,
+            "--silent-turn-continuation=false",
+            "--silent-turn-grace-secs",
+            "27",
+        ]);
+        assert!(!configured.silent_turn_continuation);
+        assert_eq!(configured.silent_turn_grace_secs, 27);
     }
 
     #[test]

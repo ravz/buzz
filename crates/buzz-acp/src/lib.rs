@@ -2196,6 +2196,8 @@ async fn tokio_main() -> Result<()> {
         idle_timeout: Duration::from_secs(config.idle_timeout_secs),
         max_turn_duration: Duration::from_secs(config.max_turn_duration_secs),
         turn_liveness_interval: Duration::from_secs(config.turn_liveness_secs),
+        silent_turn_continuation: config.silent_turn_continuation,
+        silent_turn_grace: Duration::from_secs(config.silent_turn_grace_secs),
         dedup_mode: config.dedup_mode,
         system_prompt: config.system_prompt.clone(),
         session_title: config.session_title.clone(),
@@ -2210,6 +2212,7 @@ async fn tokio_main() -> Result<()> {
         heartbeat_prompt: config.heartbeat_prompt.clone(),
         cwd,
         rest_client: relay.rest_client(),
+        authored_post_query: relay.authored_post_query_client(),
         channel_info: pool::ChannelInfoResolver::new(channel_info_map, relay.rest_client()),
         context_message_limit: config.context_message_limit,
         max_turns_per_session: config.max_turns_per_session,
@@ -2894,8 +2897,8 @@ async fn tokio_main() -> Result<()> {
                             }
 
                             let matched = filter::match_event(&buzz_event.event, buzz_event.channel_id, &rules, &pubkey_hex).await;
-                            let prompt_tag = match matched {
-                                Some(m) => m.prompt_tag,
+                            let (prompt_tag, answer_required) = match matched {
+                                Some(m) => (m.prompt_tag, m.require_mention),
                                 None => {
                                     tracing::debug!(channel_id = %buzz_event.channel_id, kind = buzz_event.event.kind.as_u16(), "event matched no rule — dropping");
                                     continue;
@@ -2922,6 +2925,7 @@ async fn tokio_main() -> Result<()> {
                                 event: buzz_event.event,
                                 received_at: std::time::Instant::now(),
                                 prompt_tag,
+                                answer_required,
                             });
                             // 👀 — immediate "seen" reaction, only if the event
                             // was actually queued (not dropped by DedupMode::Drop).
@@ -3145,8 +3149,8 @@ async fn tokio_main() -> Result<()> {
         match pool_event {
             Some(PoolEvent::Result(result)) => {
                 // Stop typing indicator for the completed channel.
-                if let PromptSource::Channel(ch) = &result.source {
-                    typing_channels.remove(ch);
+                if let Some(channel_id) = result.source.channel_id() {
+                    typing_channels.remove(&channel_id);
                 }
                 if handle_prompt_result(
                     &mut pool,
@@ -3890,11 +3894,11 @@ fn handle_prompt_result(
     pool.task_map_mut()
         .retain(|_, meta| meta.agent_index != agent_index);
     debug_assert_eq!(before, pool.task_map().len() + 1);
-    if let PromptSource::Channel(channel_id) = &result.source {
+    if let Some(channel_id) = result.source.channel_id() {
         // The task may have invalidated this session before returning. Never
         // resurrect delivery state for a dead session; its replacement must
         // receive fresh standing context and history.
-        if let Some(live_session_id) = result.agent.state.sessions.get(channel_id).cloned() {
+        if let Some(live_session_id) = result.agent.state.sessions.get(&channel_id).cloned() {
             let event_ids = successful_steer_deliveries
                 .into_iter()
                 .filter(|delivery| delivery.session_id == live_session_id)
@@ -3902,7 +3906,7 @@ fn handle_prompt_result(
             result
                 .agent
                 .state
-                .mark_channel_delivery_success(*channel_id, false, event_ids);
+                .mark_channel_delivery_success(channel_id, false, event_ids);
         }
     }
 
@@ -4024,7 +4028,10 @@ fn handle_prompt_result(
     }
 
     match &result.source {
-        PromptSource::Channel(ch) => queue.mark_complete(*ch),
+        PromptSource::Channel(channel_id)
+        | PromptSource::AnswerRequiredChannel { channel_id, .. } => {
+            queue.mark_complete(*channel_id)
+        }
         PromptSource::Heartbeat => *heartbeat_in_flight = false,
     }
 
@@ -4060,7 +4067,8 @@ fn handle_prompt_result(
     let harness_pid = std::process::id();
 
     let channel_id = match &result.source {
-        PromptSource::Channel(ch) => Some(*ch),
+        PromptSource::Channel(channel_id)
+        | PromptSource::AnswerRequiredChannel { channel_id, .. } => Some(*channel_id),
         PromptSource::Heartbeat => None,
     };
     let turn_id = result.turn_id.clone();
@@ -6765,6 +6773,8 @@ mod build_mcp_servers_tests {
             agents: 1,
             heartbeat_interval_secs: 0,
             turn_liveness_secs: 10,
+            silent_turn_continuation: true,
+            silent_turn_grace_secs: config::DEFAULT_SILENT_TURN_GRACE_SECS,
             heartbeat_prompt: None,
             system_prompt: None,
             team_instructions: None,
@@ -6989,6 +6999,8 @@ mod error_outcome_emission_tests {
             agents: 1,
             heartbeat_interval_secs: 0,
             turn_liveness_secs: 10,
+            silent_turn_continuation: true,
+            silent_turn_grace_secs: config::DEFAULT_SILENT_TURN_GRACE_SECS,
             heartbeat_prompt: None,
             system_prompt: None,
             team_instructions: None,
@@ -7578,6 +7590,7 @@ mod error_outcome_emission_tests {
                 .sign_with_keys(&keys)
                 .unwrap();
             FlushBatch {
+                answer_required: false,
                 channel_id: Uuid::new_v4(),
                 events: vec![BatchEvent {
                     event,
@@ -7685,6 +7698,7 @@ mod error_outcome_emission_tests {
                 .sign_with_keys(&keys)
                 .unwrap();
             FlushBatch {
+                answer_required: false,
                 channel_id,
                 events: vec![BatchEvent {
                     event,
@@ -7803,6 +7817,7 @@ mod error_outcome_emission_tests {
         let mut respawn_tasks = tokio::task::JoinSet::new();
         let observer = ObserverHandle::in_process();
         let batch = FlushBatch {
+            answer_required: false,
             channel_id,
             events: vec![BatchEvent {
                 event: EventBuilder::new(Kind::Custom(9), "test")
@@ -7897,6 +7912,7 @@ mod error_outcome_emission_tests {
         let mut respawn_tasks = tokio::task::JoinSet::new();
         let observer = ObserverHandle::in_process();
         let batch = FlushBatch {
+            answer_required: false,
             channel_id,
             events: vec![BatchEvent {
                 event: EventBuilder::new(Kind::Custom(9), "final-attempt")
@@ -7977,6 +7993,7 @@ mod error_outcome_emission_tests {
         );
         let channel_id = Uuid::new_v4();
         let batch = FlushBatch {
+            answer_required: false,
             channel_id,
             events: vec![BatchEvent {
                 event: original_event.clone(),
@@ -8012,6 +8029,7 @@ mod error_outcome_emission_tests {
             event: new_event.clone(),
             received_at: std::time::Instant::now(),
             prompt_tag: "test".into(),
+            answer_required: false,
         });
         let config = test_config();
         let mut heartbeat_in_flight = false;
@@ -8300,6 +8318,7 @@ mod error_outcome_emission_tests {
             .unwrap();
         let channel_id = uuid::Uuid::new_v4();
         let batch = FlushBatch {
+            answer_required: false,
             channel_id,
             events: vec![BatchEvent {
                 event,
@@ -8386,6 +8405,7 @@ mod error_outcome_emission_tests {
             .unwrap();
         let channel_id = uuid::Uuid::new_v4();
         let batch = FlushBatch {
+            answer_required: false,
             channel_id,
             events: vec![BatchEvent {
                 event,

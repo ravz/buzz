@@ -67,6 +67,12 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(20);
 /// Raised from 10s to 30s so the OS TCP connect attempt (SYN→SYN-ACK) has time
 /// to succeed at 3.4s average / 10s max observed RTT.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum time a one-shot authored-post subscription may wait for EOSE.
+///
+/// Silent-turn enforcement must fail open when the relay is unhealthy, so a
+/// missing EOSE can delay completion only by this bounded interval; it can
+/// never strand the checked-out ACP agent indefinitely.
+const ONE_SHOT_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 /// Backoff delay values shared by the initial-connect retry in
 /// `HarnessRelay::connect()` and `try_autonomous_reconnect`'s post-start
 /// reconnect loop — a spotty link should get consistent retry pacing whether
@@ -254,6 +260,154 @@ pub struct RestClient {
     pub keys: Keys,
     /// Optional NIP-OA auth tag JSON for `x-auth-tag` header (relay membership delegation).
     pub auth_tag_json: Option<String>,
+}
+
+/// Cloneable credentials for a bounded, author-filtered NIP-01 query.
+///
+/// This intentionally opens a short-lived WebSocket rather than reusing the
+/// standing channel subscription: mention-only subscriptions carry `#p=self`,
+/// which excludes an ordinary self-authored reply. The one-shot query uses an
+/// `authors` filter instead and closes as soon as EOSE arrives.
+#[derive(Debug, Clone)]
+pub struct AuthoredPostQueryClient {
+    relay_url: String,
+    keys: Keys,
+    auth_tag: Option<nostr::Tag>,
+    #[cfg(test)]
+    test_tx: Option<mpsc::UnboundedSender<TestAuthoredPostQuery>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct TestAuthoredPostQuery {
+    pub channel_id: Uuid,
+    pub since: u64,
+    pub response: tokio::sync::oneshot::Sender<Result<bool, RelayError>>,
+}
+
+impl AuthoredPostQueryClient {
+    /// Return whether kind:9 contains a post authored by this agent in the
+    /// channel since the supplied turn watermark (with the specified 60s
+    /// clock-skew allowance).
+    pub async fn has_post_since(
+        &self,
+        channel_id: Uuid,
+        turn_watermark: u64,
+    ) -> Result<bool, RelayError> {
+        let since = turn_watermark.saturating_sub(60);
+
+        #[cfg(test)]
+        if let Some(test_tx) = &self.test_tx {
+            let (response, rx) = tokio::sync::oneshot::channel();
+            test_tx
+                .send(TestAuthoredPostQuery {
+                    channel_id,
+                    since,
+                    response,
+                })
+                .map_err(|_| RelayError::ConnectionClosed)?;
+            return rx.await.map_err(|_| RelayError::ConnectionClosed)?;
+        }
+
+        self.has_post_since_relay(channel_id, since).await
+    }
+
+    async fn has_post_since_relay(&self, channel_id: Uuid, since: u64) -> Result<bool, RelayError> {
+        use nostr::{Alphabet, SingleLetterTag, Timestamp};
+
+        let (mut ws, mut handshake_buffer) =
+            do_connect(&self.relay_url, &self.keys, self.auth_tag.as_ref()).await?;
+        let subscription_id = format!("silent-turn-{}", Uuid::new_v4());
+        let h_tag = SingleLetterTag::lowercase(Alphabet::H);
+        let filter = nostr::Filter::new()
+            .author(self.keys.public_key())
+            .kind(Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE as u16))
+            .custom_tags(h_tag, [channel_id.to_string()])
+            .since(Timestamp::from(since));
+        let request = serde_json::to_string(&json!(["REQ", subscription_id, filter]))?;
+        ws_send_timeout(&mut ws, Message::Text(request.into()), WS_SEND_TIMEOUT_SECS).await?;
+
+        let deadline = tokio::time::Instant::now() + ONE_SHOT_QUERY_TIMEOUT;
+        let mut found = false;
+        loop {
+            let relay_message = if let Some(message) = handshake_buffer.pop_front() {
+                message
+            } else {
+                let remaining = deadline
+                    .checked_duration_since(tokio::time::Instant::now())
+                    .unwrap_or(Duration::ZERO);
+                if remaining.is_zero() {
+                    let _ = send_one_shot_close(&mut ws, &subscription_id).await;
+                    return Err(RelayError::Timeout);
+                }
+                let frame = timeout(remaining, ws.next())
+                    .await
+                    .map_err(|_| RelayError::Timeout)?
+                    .ok_or(RelayError::ConnectionClosed)?
+                    .map_err(|error| RelayError::WebSocket(Box::new(error)))?;
+                match frame {
+                    Message::Text(text) => parse_relay_message(&text)?,
+                    Message::Ping(data) => {
+                        ws_send_timeout(&mut ws, Message::Pong(data), WS_SEND_TIMEOUT_SECS).await?;
+                        continue;
+                    }
+                    Message::Close(_) => return Err(RelayError::ConnectionClosed),
+                    _ => continue,
+                }
+            };
+
+            match relay_message {
+                RelayMessage::Event {
+                    subscription_id: event_subscription_id,
+                    ..
+                } if event_subscription_id == subscription_id => found = true,
+                RelayMessage::Eose {
+                    subscription_id: eose_subscription_id,
+                } if eose_subscription_id == subscription_id => {
+                    send_one_shot_close(&mut ws, &subscription_id).await?;
+                    return Ok(found);
+                }
+                RelayMessage::Closed {
+                    subscription_id: closed_subscription_id,
+                    message,
+                } if closed_subscription_id == subscription_id => {
+                    return Err(RelayError::UnexpectedMessage(format!(
+                        "one-shot query closed by relay: {message}"
+                    )));
+                }
+                RelayMessage::Auth { challenge } => {
+                    send_auth_response(
+                        &mut ws,
+                        &challenge,
+                        &self.relay_url,
+                        &self.keys,
+                        self.auth_tag.as_ref(),
+                    )
+                    .await?;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_pair() -> (Self, mpsc::UnboundedReceiver<TestAuthoredPostQuery>) {
+        let (test_tx, test_rx) = mpsc::unbounded_channel();
+        (
+            Self {
+                relay_url: "ws://test.invalid".into(),
+                keys: Keys::generate(),
+                auth_tag: None,
+                test_tx: Some(test_tx),
+            },
+            test_rx,
+        )
+    }
+}
+
+async fn send_one_shot_close(ws: &mut WsStream, subscription_id: &str) -> Result<(), RelayError> {
+    let close = serde_json::to_string(&json!(["CLOSE", subscription_id]))?;
+    ws_send_timeout(ws, Message::Text(close.into()), WS_SEND_TIMEOUT_SECS).await
 }
 
 /// Whether an HTTP status code is retriable (transient server/rate-limit errors).
@@ -756,6 +910,17 @@ impl HarnessRelay {
                 .auth_tag
                 .as_ref()
                 .and_then(|t| serde_json::to_string(t.as_slice()).ok()),
+        }
+    }
+
+    /// Build a cloneable client for end-of-turn authored-post checks.
+    pub fn authored_post_query_client(&self) -> AuthoredPostQueryClient {
+        AuthoredPostQueryClient {
+            relay_url: self.relay_url.clone(),
+            keys: self.keys.clone(),
+            auth_tag: self.auth_tag.clone(),
+            #[cfg(test)]
+            test_tx: None,
         }
     }
 
@@ -4453,6 +4618,161 @@ mod tests {
                 replay_since: Some(1_000),
             },
         );
+    }
+
+    /// Documentation test for why silent-turn detection cannot use the
+    /// standing mention subscription. Its relay-side `#p=self` filter excludes
+    /// a normal reply authored by the agent because that reply does not mention
+    /// itself. The bounded author-filtered query is deliberately separate.
+    #[tokio::test]
+    async fn mention_subscription_excludes_self_authored_channel_post() {
+        let (mut client, mut server) = test_ws_pair().await;
+        let channel_id = Uuid::new_v4();
+        let agent_keys = Keys::generate();
+        let agent_pubkey = agent_keys.public_key().to_hex();
+
+        assert!(
+            send_subscribe(
+                &mut client,
+                &BgState::new(),
+                channel_id,
+                &agent_pubkey,
+                None,
+                &ChannelFilter {
+                    kinds: Some(vec![9]),
+                    require_mention: true,
+                },
+            )
+            .await,
+            "the harness subscription must be written"
+        );
+
+        let request = next_test_frame(&mut server).await;
+        let relay_filter = request
+            .get(2)
+            .and_then(Value::as_object)
+            .expect("REQ must carry one NIP-01 filter");
+        let self_post = EventBuilder::new(Kind::Custom(9), "finished")
+            .tags([Tag::parse(["h", &channel_id.to_string()]).expect("valid h tag")])
+            .sign_with_keys(&agent_keys)
+            .expect("sign self-authored channel post");
+
+        let kind_matches = relay_filter
+            .get("kinds")
+            .and_then(Value::as_array)
+            .is_none_or(|kinds| kinds.contains(&json!(self_post.kind.as_u16())));
+        let channel_matches = relay_filter
+            .get("#h")
+            .and_then(Value::as_array)
+            .is_some_and(|channels| channels.contains(&json!(channel_id.to_string())));
+        let mention_matches =
+            relay_filter
+                .get("#p")
+                .and_then(Value::as_array)
+                .is_none_or(|pubkeys| {
+                    self_post.tags.iter().any(|tag| {
+                        let values = tag.as_slice();
+                        values.first().map(String::as_str) == Some("p")
+                            && values
+                                .get(1)
+                                .is_some_and(|value| pubkeys.contains(&json!(value.as_str())))
+                    })
+                });
+
+        assert!(kind_matches && channel_matches);
+        assert!(
+            !mention_matches,
+            "relay REQ {request} unexpectedly matched the agent's own ordinary channel post {}; \
+             if the standing subscription shape changes, re-evaluate whether the separate \
+             one-shot query is still required",
+            serde_json::to_string(&self_post).expect("serialize self post"),
+        );
+    }
+
+    /// Acceptance test for the amended load-bearing assumption: a separate,
+    /// author-filtered NIP-01 query can return the agent's own ordinary channel
+    /// post even though the standing mention subscription above cannot.
+    #[tokio::test]
+    async fn one_shot_authored_query_returns_self_authored_channel_post() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock relay");
+        let address = listener.local_addr().expect("read mock relay address");
+        let relay_url = format!("ws://{address}");
+        let channel_id = Uuid::new_v4();
+        let agent_keys = Keys::generate();
+        let server_keys = agent_keys.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept query client");
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("complete query websocket handshake");
+
+            socket
+                .send(Message::Text(
+                    json!(["AUTH", "silent-turn-test-challenge"])
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .expect("send NIP-42 challenge");
+            let auth = next_test_frame(&mut socket).await;
+            assert_eq!(auth[0], "AUTH");
+            let auth_event_id = auth[1]["id"].as_str().expect("AUTH event id");
+            socket
+                .send(Message::Text(
+                    json!(["OK", auth_event_id, true, ""]).to_string().into(),
+                ))
+                .await
+                .expect("accept NIP-42 event");
+
+            let request = next_test_frame(&mut socket).await;
+            assert_eq!(request[0], "REQ");
+            let subscription_id = request[1].as_str().expect("subscription id").to_string();
+            let filter = request[2].as_object().expect("one-shot NIP-01 filter");
+            assert_eq!(
+                filter.get("authors"),
+                Some(&json!([server_keys.public_key().to_hex()]))
+            );
+            assert_eq!(filter.get("#h"), Some(&json!([channel_id.to_string()])));
+            assert_eq!(filter.get("kinds"), Some(&json!([9])));
+            assert_eq!(filter.get("since"), Some(&json!(940)));
+
+            let self_post = EventBuilder::new(Kind::Custom(9), "finished")
+                .tags([Tag::parse(["h", &channel_id.to_string()]).expect("valid h tag")])
+                .custom_created_at(nostr::Timestamp::from(1_001_u64))
+                .sign_with_keys(&server_keys)
+                .expect("sign self-authored channel post");
+            socket
+                .send(Message::Text(
+                    json!(["EVENT", subscription_id, self_post])
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .expect("send self-authored event");
+            socket
+                .send(Message::Text(
+                    json!(["EOSE", subscription_id]).to_string().into(),
+                ))
+                .await
+                .expect("finish query");
+
+            let close = next_test_frame(&mut socket).await;
+            assert_eq!(close, json!(["CLOSE", subscription_id]));
+        });
+
+        let client = AuthoredPostQueryClient {
+            relay_url,
+            keys: agent_keys,
+            auth_tag: None,
+            test_tx: None,
+        };
+        assert!(client
+            .has_post_since(channel_id, 1_000)
+            .await
+            .expect("one-shot query should complete"));
+        server.await.expect("mock relay task");
     }
 
     #[tokio::test]

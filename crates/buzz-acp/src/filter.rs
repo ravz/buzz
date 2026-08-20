@@ -153,6 +153,8 @@ pub struct MatchedRule {
     pub rule_index: usize,
     /// Prompt tag to use (rule's `prompt_tag` or its `name`).
     pub prompt_tag: String,
+    /// Whether this match represented a direct mention that requires an answer.
+    pub require_mention: bool,
 }
 
 /// Maximum expression length accepted by `evaluate_filter`.
@@ -453,6 +455,7 @@ pub async fn match_event(
         return Some(MatchedRule {
             rule_index: index,
             prompt_tag,
+            require_mention: rule.require_mention,
         });
     }
 
@@ -661,6 +664,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(matched.prompt_tag, "mentioned");
+        assert!(matched.require_mention);
     }
 
     #[tokio::test]
