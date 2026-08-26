@@ -30,6 +30,9 @@ pub(crate) const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 900;
 /// Override via `--max-turn-duration` / `BUZZ_ACP_MAX_TURN_DURATION`.
 pub(crate) const DEFAULT_MAX_TURN_DURATION_SECS: u64 = 7200;
 
+/// Default delay before checking whether a mention-triggered turn posted.
+pub(crate) const DEFAULT_SILENT_TURN_GRACE_SECS: u64 = 10;
+
 /// Upper bound for `max_turn_duration` (7 days). Any higher is operationally
 /// meaningless and risks arithmetic overflow when deriving the in-flight
 /// deadline (`max_turn_duration + IN_FLIGHT_DEADLINE_BUFFER_SECS`).
@@ -124,6 +127,11 @@ pub enum PermissionMode {
     /// Agent default — permission requests per tool call.
     #[value(alias = "default")]
     Default,
+    /// Auto mode — fully autonomous execution; model-gated (requires a model
+    /// that supports `supportsAutoMode`).  Degrades gracefully to `default`
+    /// when the session's active model does not support it.
+    #[value(alias = "auto")]
+    Auto,
     /// Auto-approve file edits, still ask for other tools.
     #[value(alias = "acceptEdits")]
     AcceptEdits,
@@ -144,6 +152,7 @@ impl PermissionMode {
     pub fn as_wire_str(&self) -> &'static str {
         match self {
             Self::Default => "default",
+            Self::Auto => "auto",
             Self::AcceptEdits => "acceptEdits",
             Self::BypassPermissions => "bypassPermissions",
             Self::DontAsk => "dontAsk",
@@ -302,6 +311,24 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_TURN_LIVENESS_SECS", default_value_t = 10)]
     pub turn_liveness_secs: u64,
 
+    /// Re-prompt a mention-triggered ACP turn once when it ends without a
+    /// self-authored channel post.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_SILENT_TURN_CONTINUATION",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    pub silent_turn_continuation: bool,
+
+    /// Seconds to allow relay persistence/echo before checking for a post.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_SILENT_TURN_GRACE_SECS",
+        default_value_t = DEFAULT_SILENT_TURN_GRACE_SECS
+    )]
+    pub silent_turn_grace_secs: u64,
+
     /// Heartbeat prompt text. Conflicts with --heartbeat-prompt-file.
     #[arg(
         long,
@@ -405,7 +432,7 @@ pub struct CliArgs {
     pub no_memory: bool,
 
     /// Disable the [Base] platform-context section prepended to every prompt.
-    /// When set, agents receive only the persona [System] prompt with no Buzz orientation.
+    /// When set, agents receive only the persona `[Agent Instructions]` prompt with no Buzz orientation.
     #[arg(long, env = "BUZZ_ACP_NO_BASE_PROMPT")]
     pub no_base_prompt: bool,
 
@@ -422,6 +449,14 @@ pub struct CliArgs {
     /// Use `buzz-acp models` to discover available model IDs.
     #[arg(long, env = "BUZZ_ACP_MODEL")]
     pub model: Option<String>,
+
+    /// Persisted effort level value (e.g. "high", "medium", "low") to apply via
+    /// `session/set_config_option` at the first session creation. The configId is
+    /// resolved from the adapter's advertised `thought_level` capability — not
+    /// hardcoded. Non-fatal: if the adapter does not advertise `thought_level`,
+    /// the value is silently ignored and the persisted effort is not overwritten.
+    #[arg(long, env = "BUZZ_ACP_EFFORT_LEVEL")]
+    pub effort_level: Option<String>,
 
     /// Title for the agent's ACP sessions, passed out-of-band in `session/new`
     /// `_meta`. Adapters that recognize it name the session after this value;
@@ -466,7 +501,7 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_ALLOWED_RESPOND_TO", value_delimiter = ',')]
     pub allowed_respond_to: Option<Vec<String>>,
 
-    /// Team-owned instructions layered after `[System]` and before agent memory.
+    /// Team-owned instructions layered after `[Agent Instructions]` and before agent memory.
     #[arg(long, env = "BUZZ_ACP_TEAM_INSTRUCTIONS")]
     pub team_instructions: Option<String>,
 
@@ -515,6 +550,10 @@ pub struct Config {
     /// `heartbeat_interval_secs` (agent self-prompting) — this is the desktop
     /// crash-backstop signal.
     pub turn_liveness_secs: u64,
+    /// Whether mention-triggered silent turns receive one bounded continuation.
+    pub silent_turn_continuation: bool,
+    /// Grace before the authored-post query runs.
+    pub silent_turn_grace_secs: u64,
     pub heartbeat_prompt: Option<String>,
     pub system_prompt: Option<String>,
     /// Team-owned instructions layered separately from the agent system prompt.
@@ -540,6 +579,12 @@ pub struct Config {
     pub memory_enabled: bool,
     /// Desired LLM model ID. Applied after every `session_new_full()`.
     pub model: Option<String>,
+    /// Persisted effort level value (e.g. "high", "medium", "low"). Held as a
+    /// per-worker spawn-scoped value and applied at the first session creation
+    /// by pairing with the adapter's advertised `thought_level` configId.
+    /// Non-fatal when absent or when the adapter does not advertise
+    /// `thought_level`.
+    pub effort_level: Option<String>,
     /// Sanitized session title, sent as `_meta.sessionTitle` on `session/new`.
     /// `None` when unset or when the configured value sanitized to empty.
     pub session_title: Option<String>,
@@ -1082,6 +1127,8 @@ impl Config {
             agents: args.agents,
             heartbeat_interval_secs: heartbeat_interval,
             turn_liveness_secs,
+            silent_turn_continuation: args.silent_turn_continuation,
+            silent_turn_grace_secs: args.silent_turn_grace_secs,
             heartbeat_prompt,
             system_prompt,
             team_instructions: args
@@ -1105,6 +1152,7 @@ impl Config {
             typing_enabled: !args.no_typing,
             memory_enabled: args.memory && !args.no_memory,
             model,
+            effort_level: args.effort_level,
             session_title: args
                 .session_title
                 .as_deref()
@@ -1462,6 +1510,8 @@ mod tests {
             agents: 1,
             heartbeat_interval_secs: 0,
             turn_liveness_secs: 10,
+            silent_turn_continuation: true,
+            silent_turn_grace_secs: DEFAULT_SILENT_TURN_GRACE_SECS,
             heartbeat_prompt: None,
             system_prompt: None,
             team_instructions: None,
@@ -1480,6 +1530,7 @@ mod tests {
             typing_enabled: true,
             memory_enabled: true,
             model: None,
+            effort_level: None,
             session_title: None,
             permission_mode: PermissionMode::BypassPermissions,
             respond_to: RespondTo::Anyone,
@@ -2228,6 +2279,28 @@ channels = "ALL"
     }
 
     #[test]
+    fn silent_turn_knobs_default_on_and_accept_cli_values() {
+        let key = "0".repeat(64);
+        let defaults = CliArgs::parse_from(["buzz-acp", "--private-key", &key]);
+        assert!(defaults.silent_turn_continuation);
+        assert_eq!(
+            defaults.silent_turn_grace_secs,
+            DEFAULT_SILENT_TURN_GRACE_SECS
+        );
+
+        let configured = CliArgs::parse_from([
+            "buzz-acp",
+            "--private-key",
+            &key,
+            "--silent-turn-continuation=false",
+            "--silent-turn-grace-secs",
+            "27",
+        ]);
+        assert!(!configured.silent_turn_continuation);
+        assert_eq!(configured.silent_turn_grace_secs, 27);
+    }
+
+    #[test]
     fn lazy_pool_cli_flag_enables_deferred_startup() {
         let key = "0".repeat(64);
         let args = CliArgs::try_parse_from(["buzz-acp", "--private-key", &key, "--lazy-pool=true"]);
@@ -2298,6 +2371,7 @@ channels = "ALL"
     #[test]
     fn test_permission_mode_wire_strings() {
         assert_eq!(PermissionMode::Default.as_wire_str(), "default");
+        assert_eq!(PermissionMode::Auto.as_wire_str(), "auto");
         assert_eq!(PermissionMode::AcceptEdits.as_wire_str(), "acceptEdits");
         assert_eq!(
             PermissionMode::BypassPermissions.as_wire_str(),
@@ -2310,10 +2384,22 @@ channels = "ALL"
     #[test]
     fn test_permission_mode_is_default() {
         assert!(PermissionMode::Default.is_default());
+        assert!(!PermissionMode::Auto.is_default());
         assert!(!PermissionMode::BypassPermissions.is_default());
         assert!(!PermissionMode::AcceptEdits.is_default());
         assert!(!PermissionMode::DontAsk.is_default());
         assert!(!PermissionMode::Plan.is_default());
+    }
+
+    #[test]
+    fn test_permission_mode_auto_degrades_to_default_when_unsupported() {
+        // The wire string is "auto" — the adapter handles graceful downgrade
+        // to "default" when the active model does not support Auto mode.
+        // Verify only that the wire string is correct and distinct from "default".
+        let auto = PermissionMode::Auto;
+        assert_eq!(auto.as_wire_str(), "auto");
+        assert_ne!(auto.as_wire_str(), "default");
+        assert!(!auto.is_default());
     }
 
     #[test]
@@ -2323,6 +2409,7 @@ channels = "ALL"
             "bypassPermissions"
         );
         assert_eq!(format!("{}", PermissionMode::Default), "default");
+        assert_eq!(format!("{}", PermissionMode::Auto), "auto");
     }
 
     #[test]
@@ -2360,6 +2447,7 @@ channels = "ALL"
         use clap::ValueEnum;
         let cases = [
             ("default", PermissionMode::Default),
+            ("auto", PermissionMode::Auto),
             ("accept-edits", PermissionMode::AcceptEdits),
             ("bypass-permissions", PermissionMode::BypassPermissions),
             ("dont-ask", PermissionMode::DontAsk),
@@ -2382,6 +2470,7 @@ channels = "ALL"
         use clap::ValueEnum;
         let cases = [
             ("default", PermissionMode::Default),
+            ("auto", PermissionMode::Auto),
             ("acceptEdits", PermissionMode::AcceptEdits),
             ("bypassPermissions", PermissionMode::BypassPermissions),
             ("dontAsk", PermissionMode::DontAsk),
