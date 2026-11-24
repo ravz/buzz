@@ -15,6 +15,7 @@
 
 use nostr::{Event, ToBech32};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -109,6 +110,9 @@ pub struct QueuedEvent {
     pub received_at: Instant,
     /// Tag identifying which rule (or mode) matched this event.
     pub prompt_tag: String,
+    /// An unused continuation for a mention-required trigger. The same flag
+    /// is shared by the queued, in-flight, and panic-recovery copies.
+    pub(crate) answer_required: Option<Arc<AtomicBool>>,
     /// Original-message routing for a kind:40003 edit, resolved once at
     /// admission. `None` for ordinary events and for edits whose original
     /// could not be fetched (routing then falls back to the edit target id).
@@ -120,6 +124,7 @@ impl QueuedEvent {
         BatchEvent {
             event: self.event,
             prompt_tag: self.prompt_tag,
+            answer_required: self.answer_required,
             received_at: self.received_at,
             edit: self.edit,
         }
@@ -132,6 +137,8 @@ pub struct BatchEvent {
     pub event: Event,
     pub prompt_tag: String,
     pub received_at: Instant,
+    /// See [`QueuedEvent::answer_required`].
+    pub(crate) answer_required: Option<Arc<AtomicBool>>,
     /// See [`QueuedEvent::edit`].
     pub edit: Option<ResolvedEdit>,
 }
@@ -281,6 +288,30 @@ pub struct FlushBatch {
     pub cancel_reason: Option<CancelReason>,
 }
 
+impl FlushBatch {
+    fn answer_requirements(&self) -> impl Iterator<Item = &AtomicBool> {
+        self.events
+            .iter()
+            .chain(&self.cancelled_events)
+            .filter_map(|event| event.answer_required.as_deref())
+    }
+
+    pub(crate) fn needs_answer(&self) -> bool {
+        self.answer_requirements()
+            .any(|pending| pending.load(Ordering::Relaxed))
+    }
+
+    /// Spend the continuation for every eligible mention in this prompt,
+    /// including across retries and cancel/merge recovery.
+    pub(crate) fn claim_continuation(&self) -> bool {
+        let mut claimed = false;
+        for pending in self.answer_requirements() {
+            claimed |= pending.swap(false, Ordering::Relaxed);
+        }
+        claimed
+    }
+}
+
 /// Per-channel event queue with per-channel in-flight enforcement.
 ///
 /// # State Machine
@@ -406,8 +437,14 @@ impl EventQueue {
     pub fn extend_in_flight_deadline<K: IntoScope>(&mut self, scope: K, max_turn_secs: u64) {
         let scope = scope.into_scope();
         if let Some(current) = self.in_flight_deadlines.get_mut(&scope) {
-            let extended = Instant::now()
-                + Duration::from_secs(max_turn_secs + IN_FLIGHT_DEADLINE_BUFFER_SECS);
+            let now = Instant::now();
+            let budget = Duration::from_secs(max_turn_secs)
+                .saturating_add(Duration::from_secs(IN_FLIGHT_DEADLINE_BUFFER_SECS));
+            // Huge configured grace values can overflow Instant. Tokio sleeps
+            // also fall back to a distant deadline when their addition overflows.
+            let extended = now
+                .checked_add(budget)
+                .unwrap_or_else(|| now + Duration::from_secs(31 * 365 * 24 * 60 * 60));
             if extended > *current {
                 tracing::info!(
                     channel_id = %scope.channel_id(),
@@ -746,6 +783,7 @@ impl EventQueue {
                 event: be.event,
                 prompt_tag: be.prompt_tag,
                 received_at: be.received_at, // preserve original timestamp (#46)
+                answer_required: be.answer_required,
                 edit: be.edit,
             });
         }
@@ -811,6 +849,7 @@ impl EventQueue {
                 event: be.event,
                 prompt_tag: be.prompt_tag,
                 received_at: be.received_at,
+                answer_required: be.answer_required,
                 edit: be.edit,
             });
         }
@@ -2720,6 +2759,7 @@ mod tests {
     /// Build a QueuedEvent for the given channel (conversation scope).
     fn make_queued(channel_id: Uuid, content: &str) -> QueuedEvent {
         QueuedEvent {
+            answer_required: None,
             edit: None,
             channel_id,
             scope: conv(channel_id),
@@ -2732,6 +2772,7 @@ mod tests {
     /// Build a QueuedEvent with a specific `received_at` offset from now.
     fn make_queued_at(channel_id: Uuid, content: &str, age: Duration) -> QueuedEvent {
         QueuedEvent {
+            answer_required: None,
             edit: None,
             channel_id,
             scope: conv(channel_id),
@@ -2754,6 +2795,7 @@ mod tests {
             .sign_with_keys(&keys)
             .unwrap();
         QueuedEvent {
+            answer_required: None,
             edit: None,
             channel_id,
             scope: conv(channel_id),
@@ -2782,6 +2824,7 @@ mod tests {
     /// Build a QueuedEvent for an explicit scope.
     fn make_scoped(scope: SessionScope, content: &str) -> QueuedEvent {
         QueuedEvent {
+            answer_required: None,
             edit: None,
             channel_id: scope.channel_id(),
             scope,
@@ -2957,6 +3000,25 @@ mod tests {
     }
 
     #[test]
+    fn answer_required_survives_queue_batching() {
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let channel_id = Uuid::new_v4();
+        queue.push(make_queued(channel_id, "scheduled"));
+        let mut mention = make_queued(channel_id, "direct mention");
+        mention.answer_required = Some(Arc::new(true.into()));
+        queue.push(mention);
+
+        let batch = queue.flush_next().expect("batched event");
+        assert!(batch.needs_answer());
+        let recovery_copy = batch.clone();
+        queue.requeue_as_cancelled(batch, CancelReason::Steer);
+        queue.mark_complete(channel_id);
+        let redispatched = queue.flush_next().expect("cancelled batch");
+        assert!(redispatched.claim_continuation());
+        assert!(!recovery_copy.claim_continuation());
+    }
+
+    #[test]
     fn test_mark_complete_enables_flush() {
         let mut q = EventQueue::new(DedupMode::Queue);
         let ch = Uuid::new_v4();
@@ -3094,6 +3156,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event,
                 prompt_tag: "@mention".into(),
@@ -3126,12 +3189,14 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event: make_event("the new message"),
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
             }],
             cancelled_events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event: make_event("the original task"),
                 prompt_tag: "@mention".into(),
@@ -3267,12 +3332,14 @@ mod tests {
             scope: conv(ch),
             events: vec![
                 BatchEvent {
+                    answer_required: None,
                     edit: None,
                     event: make_event("new one"),
                     prompt_tag: "@mention".into(),
                     received_at: Instant::now(),
                 },
                 BatchEvent {
+                    answer_required: None,
                     edit: None,
                     event: make_event("new two"),
                     prompt_tag: "@mention".into(),
@@ -3280,6 +3347,7 @@ mod tests {
                 },
             ],
             cancelled_events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event: make_event("original"),
                 prompt_tag: "@mention".into(),
@@ -3327,12 +3395,14 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event: steering,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
             }],
             cancelled_events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event: original,
                 prompt_tag: "@mention".into(),
@@ -3502,18 +3572,21 @@ mod tests {
             scope: conv(ch),
             events: vec![
                 BatchEvent {
+                    answer_required: None,
                     edit: None,
                     event: e1,
                     prompt_tag: "tag-a".into(),
                     received_at: Instant::now(),
                 },
                 BatchEvent {
+                    answer_required: None,
                     edit: None,
                     event: e2,
                     prompt_tag: "tag-b".into(),
                     received_at: Instant::now(),
                 },
                 BatchEvent {
+                    answer_required: None,
                     edit: None,
                     event: e3,
                     prompt_tag: "tag-c".into(),
@@ -3545,6 +3618,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -3570,6 +3644,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -3604,6 +3679,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -3636,6 +3712,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -3665,6 +3742,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -3691,6 +3769,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -3754,6 +3833,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event: make_event("hello"),
                 prompt_tag: "test".into(),
@@ -3809,6 +3889,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -3849,6 +3930,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -4078,6 +4160,7 @@ mod tests {
         let old_time = Instant::now() - Duration::from_secs(10);
 
         q.push(QueuedEvent {
+            answer_required: None,
             edit: None,
             channel_id: ch,
             scope: conv(ch),
@@ -4111,12 +4194,14 @@ mod tests {
             channel_id: ch,
             scope: scope.clone(),
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event: make_event("the follow-up"),
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
             }],
             cancelled_events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event: make_event("the original request"),
                 prompt_tag: "@mention".into(),
@@ -4442,6 +4527,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -4477,6 +4563,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event,
                 prompt_tag: "dm".into(),
@@ -4526,6 +4613,7 @@ mod tests {
                         channel_id,
                         scope: SessionScope::derive(policy, channel_id, is_dm, event),
                         events: vec![BatchEvent {
+                            answer_required: None,
                             edit: None,
                             event: event.clone(),
                             prompt_tag: "@mention".into(),
@@ -4609,6 +4697,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event,
                 prompt_tag: "@mention".into(),
@@ -4637,6 +4726,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event,
                 prompt_tag: "@mention".into(),
@@ -4748,6 +4838,7 @@ mod tests {
         let root_a = "a".repeat(64);
         let root_b = "b".repeat(64);
         let reply = |content: &str, root: &str| BatchEvent {
+            answer_required: None,
             edit: None,
             event: make_event_with_tags(
                 content,
@@ -4825,6 +4916,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event,
                 prompt_tag: "dm".into(),
@@ -4883,6 +4975,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event,
                 prompt_tag: "@mention".into(),
@@ -5076,6 +5169,7 @@ mod tests {
             (other_agent.clone(), profile(true)),
         ]);
         let in_thread = |keys: &Keys, content: &str| BatchEvent {
+            answer_required: None,
             edit: None,
             event: EventBuilder::new(Kind::Custom(9), content)
                 .tags([
@@ -5157,6 +5251,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event,
                 prompt_tag: "dm".into(),
@@ -5229,6 +5324,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -5264,6 +5360,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event: make_event("follow up"),
                 prompt_tag: "dm".into(),
@@ -5316,6 +5413,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event,
                 prompt_tag: "dm".into(),
@@ -5360,6 +5458,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -5386,6 +5485,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -5411,6 +5511,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -5446,6 +5547,7 @@ mod tests {
             ch,
             None,
             &BatchEvent {
+                answer_required: None,
                 edit: None,
                 event: direct_event,
                 prompt_tag: "test".into(),
@@ -5474,6 +5576,7 @@ mod tests {
             ch,
             None,
             &BatchEvent {
+                answer_required: None,
                 edit: None,
                 event: nested_event,
                 prompt_tag: "test".into(),
@@ -5842,6 +5945,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event,
                 prompt_tag: "@mention".into(),
@@ -5886,6 +5990,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event,
                 prompt_tag: "@mention".into(),
@@ -5924,6 +6029,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -5955,6 +6061,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -6001,6 +6108,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event,
                 prompt_tag: "@mention".into(),
@@ -6039,6 +6147,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event,
                 prompt_tag: "@mention".into(),
@@ -6077,12 +6186,14 @@ mod tests {
             scope: conv(ch),
             events: vec![
                 BatchEvent {
+                    answer_required: None,
                     edit: None,
                     event: plain,
                     prompt_tag: "test".into(),
                     received_at: Instant::now(),
                 },
                 BatchEvent {
+                    answer_required: None,
                     edit: None,
                     event: threaded,
                     prompt_tag: "@mention".into(),
@@ -6117,12 +6228,14 @@ mod tests {
             scope: conv(ch),
             events: vec![
                 BatchEvent {
+                    answer_required: None,
                     edit: None,
                     event: threaded,
                     prompt_tag: "@mention".into(),
                     received_at: Instant::now(),
                 },
                 BatchEvent {
+                    answer_required: None,
                     edit: None,
                     event: plain,
                     prompt_tag: "test".into(),
@@ -6153,6 +6266,7 @@ mod tests {
             channel_id,
             scope: conv(channel_id),
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event: make_event(content),
                 prompt_tag: "test".into(),
@@ -6231,6 +6345,7 @@ mod tests {
         // Multi-event batch → no pass-through.
         let mut multi = make_single_batch("@Eva /init");
         multi.events.push(BatchEvent {
+            answer_required: None,
             edit: None,
             event: make_event("another message"),
             prompt_tag: "test".into(),
@@ -6241,6 +6356,7 @@ mod tests {
         // Cancelled carryover → no pass-through.
         let mut cancelled = make_single_batch("@Eva /init");
         cancelled.cancelled_events.push(BatchEvent {
+            answer_required: None,
             edit: None,
             event: make_event("interrupted"),
             prompt_tag: "test".into(),
@@ -6457,6 +6573,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event: make_event("hi"),
                 prompt_tag: "test".into(),
@@ -6488,6 +6605,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event: make_event("hi"),
                 prompt_tag: "test".into(),
@@ -6518,6 +6636,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event: make_event("hi"),
                 prompt_tag: "test".into(),
@@ -6749,6 +6868,7 @@ mod tests {
 
     fn queued_edit(channel_id: Uuid, target: &str, edit: Option<ResolvedEdit>) -> QueuedEvent {
         QueuedEvent {
+            answer_required: None,
             edit,
             channel_id,
             scope: conv(channel_id),
@@ -6764,6 +6884,7 @@ mod tests {
             channel_id,
             scope: conv(channel_id),
             events: vec![BatchEvent {
+                answer_required: None,
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
@@ -7173,6 +7294,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),

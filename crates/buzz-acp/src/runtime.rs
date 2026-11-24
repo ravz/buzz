@@ -9,7 +9,7 @@ use std::{collections::HashMap, time::Duration};
 use uuid::Uuid;
 
 pub(crate) enum SessionMode {
-    Conversation,
+    Conversation(Option<relay::AuthoredPostQueryClient>),
     Task,
 }
 
@@ -88,6 +88,7 @@ fn make_prompt_context(
         idle_timeout: Duration::from_secs(config.idle_timeout_secs),
         max_turn_duration: Duration::from_secs(config.max_turn_duration_secs),
         turn_liveness_interval: Duration::from_secs(config.turn_liveness_secs),
+        silent_turn_grace: Duration::from_secs(config.silent_turn_grace_secs),
         dedup_mode: config.dedup_mode,
         system_prompt: config.system_prompt.clone(),
         session_title: config.session_title.clone(),
@@ -108,6 +109,10 @@ fn make_prompt_context(
             })
         },
         heartbeat_prompt: config.heartbeat_prompt.clone(),
+        authored_post_query: match mode {
+            SessionMode::Conversation(query) => query,
+            SessionMode::Task => None,
+        },
         cwd,
         rest_client: rest_client.clone(),
         channel_info: pool::ChannelInfoResolver::new(channels, rest_client),

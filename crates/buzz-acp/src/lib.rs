@@ -788,6 +788,7 @@ struct NormalListenerIngress {
     buzz_event: relay::BuzzEvent,
     effective_author: String,
     prompt_tag: String,
+    answer_required: bool,
     /// Original-message routing for an admitted edit; see
     /// [`NormalListenerIngress::resolve_edit_routing`].
     edit: Option<queue::ResolvedEdit>,
@@ -811,6 +812,7 @@ impl AuthorizedNormalListenerEvent {
             buzz_event,
             effective_author,
             prompt_tag: matched.prompt_tag,
+            answer_required: matched.require_mention,
             edit: None,
         })
     }
@@ -919,6 +921,7 @@ impl NormalListenerIngress {
             buzz_event,
             effective_author,
             prompt_tag,
+            answer_required,
             edit,
         } = self;
         let reaction_target_id = queue::reaction_target_id(&buzz_event.event);
@@ -927,6 +930,7 @@ impl NormalListenerIngress {
             event: buzz_event.event.clone(),
             prompt_tag: prompt_tag.clone(),
             received_at,
+            answer_required: None,
             edit: edit.clone(),
         };
         let channel_id = buzz_event.channel_id;
@@ -936,6 +940,7 @@ impl NormalListenerIngress {
             event: buzz_event.event,
             received_at,
             prompt_tag,
+            answer_required: answer_required.then(|| Arc::new(true.into())),
             edit,
         });
         QueuedNormalListenerEvent {
@@ -3086,11 +3091,17 @@ async fn run_harness(
         );
     }
 
-    let ctx = Arc::new(runtime.prompt_context(
-        relay.rest_client(),
-        channel_info_map,
-        SessionMode::Conversation,
-    )?);
+    let ctx = Arc::new(
+        runtime.prompt_context(
+            relay.rest_client(),
+            channel_info_map,
+            SessionMode::Conversation(
+                config
+                    .silent_turn_continuation
+                    .then(|| relay.authored_post_query_client()),
+            ),
+        )?,
+    );
 
     if !config.memory_enabled {
         tracing::info!(
@@ -4200,7 +4211,14 @@ async fn run_harness(
                     "non-cancelling steer ack received"
                 );
                 if let Ok(pool::SteerAck::Success { session_id }) = &ack {
-                    queue.extend_in_flight_deadline(&scope, config.max_turn_duration_secs);
+                    let budget = pool
+                        .task_map()
+                        .values()
+                        .find(|meta| meta.scope.as_ref() == Some(&scope))
+                        .and_then(|meta| meta.recoverable_batch.as_ref())
+                        .and_then(|batch| ctx.silent_turn_budget(batch))
+                        .unwrap_or(ctx.max_turn_duration);
+                    queue.extend_in_flight_deadline(&scope, budget.as_secs());
                     if !pool.record_successful_steer(&scope, event_id.clone(), session_id.clone()) {
                         tracing::warn!(
                             channel = %channel_id,
@@ -4831,6 +4849,7 @@ mod try_native_steer_fallback_log_tests {
         // attempt (see `try_native_steer`'s doc comment).
         assert!(
             queue.push(QueuedEvent {
+                answer_required: None,
                 channel_id: Uuid::nil(),
                 scope: busy_scope.clone(),
                 event: event.clone(),
@@ -4849,6 +4868,7 @@ mod try_native_steer_fallback_log_tests {
                 &mut queue,
                 busy_scope.clone(),
                 queue::BatchEvent {
+                    answer_required: None,
                     event,
                     prompt_tag: "mention".into(),
                     received_at: std::time::Instant::now(),
@@ -5083,6 +5103,9 @@ fn dispatch_pending(
         }
         tracing::debug!(agent = agent.index, channel = %channel_id, scope = %scope.telemetry_label(), affinity_hit, "agent_claimed");
 
+        if let Some(budget) = ctx.silent_turn_budget(&batch) {
+            queue.extend_in_flight_deadline(&scope, budget.as_secs());
+        }
         let recoverable_batch = match ctx.dedup_mode {
             DedupMode::Queue => Some(batch.clone()),
             DedupMode::Drop => None,
@@ -6958,6 +6981,7 @@ mod owner_control_command_tests {
 
         let oldest = std::time::Instant::now() - Duration::from_secs(1);
         queue.push(queue::QueuedEvent {
+            answer_required: None,
             edit: None,
             channel_id,
             scope: held_scope.clone(),
@@ -6967,6 +6991,7 @@ mod owner_control_command_tests {
         });
         for i in 0..500 {
             queue.push(queue::QueuedEvent {
+                answer_required: None,
                 edit: None,
                 channel_id,
                 scope: surviving_scope.clone(),
@@ -10141,6 +10166,8 @@ mod build_mcp_servers_tests {
             agents: 1,
             heartbeat_interval_secs: 0,
             turn_liveness_secs: 10,
+            silent_turn_continuation: true,
+            silent_turn_grace_secs: config::DEFAULT_SILENT_TURN_GRACE_SECS,
             heartbeat_prompt: None,
             system_prompt: None,
             team_instructions: None,
@@ -10658,6 +10685,7 @@ mod edit_native_steer_tests {
         let original = message(Some(&root));
         let edit = edit_event(&original.id.to_hex(), &[]);
         let be = queue::BatchEvent {
+            answer_required: None,
             event: edit.clone(),
             prompt_tag: "@mention".into(),
             received_at: std::time::Instant::now(),
@@ -10692,6 +10720,7 @@ mod edit_native_steer_tests {
             },
             effective_author: "author".into(),
             prompt_tag: "@mention".into(),
+            answer_required: true,
             edit: Some(resolved.clone()),
         };
         let scope = ingress.session_scope(scope::SessionPolicy::Channel, false);
@@ -10739,6 +10768,7 @@ mod edit_native_steer_tests {
                 },
                 effective_author: "author".into(),
                 prompt_tag: "@mention".into(),
+                answer_required: true,
                 edit,
             };
 
@@ -10919,6 +10949,7 @@ mod edit_native_steer_tests {
             },
             effective_author: "author".into(),
             prompt_tag: "@mention".into(),
+            answer_required: true,
             edit: None,
         };
         let running = ingress(running_event);
@@ -11278,6 +11309,8 @@ mod error_outcome_emission_tests {
             agents: 1,
             heartbeat_interval_secs: 0,
             turn_liveness_secs: 10,
+            silent_turn_continuation: true,
+            silent_turn_grace_secs: config::DEFAULT_SILENT_TURN_GRACE_SECS,
             heartbeat_prompt: None,
             system_prompt: None,
             team_instructions: None,
@@ -11925,6 +11958,7 @@ mod error_outcome_emission_tests {
             .sign_with_keys(&Keys::generate())
             .unwrap();
         queue.push(queue::QueuedEvent {
+            answer_required: None,
             edit: None,
             channel_id,
             scope: scope.clone(),
@@ -12124,6 +12158,7 @@ mod error_outcome_emission_tests {
                 channel_id: __cid,
                 scope: scope::SessionScope::Conversation { channel_id: __cid },
                 events: vec![BatchEvent {
+                    answer_required: None,
                     edit: None,
                     event,
                     prompt_tag: "test".into(),
@@ -12235,6 +12270,7 @@ mod error_outcome_emission_tests {
                 channel_id,
                 scope: scope::SessionScope::Conversation { channel_id },
                 events: vec![BatchEvent {
+                    answer_required: None,
                     edit: None,
                     event,
                     prompt_tag: "test".into(),
@@ -12358,6 +12394,7 @@ mod error_outcome_emission_tests {
             channel_id,
             scope: scope::SessionScope::Conversation { channel_id },
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event: EventBuilder::new(Kind::Custom(9), "test")
                     .sign_with_keys(&Keys::generate())
@@ -12456,6 +12493,7 @@ mod error_outcome_emission_tests {
             channel_id,
             scope: scope::SessionScope::Conversation { channel_id },
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event: EventBuilder::new(Kind::Custom(9), "final-attempt")
                     .sign_with_keys(&Keys::generate())
@@ -12539,6 +12577,7 @@ mod error_outcome_emission_tests {
             channel_id,
             scope: scope::SessionScope::Conversation { channel_id },
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event: original_event.clone(),
                 prompt_tag: "test".into(),
@@ -12570,6 +12609,7 @@ mod error_outcome_emission_tests {
         // out on drain — so it is already queued by the time
         // handle_prompt_result runs.
         queue.push(QueuedEvent {
+            answer_required: None,
             edit: None,
             channel_id,
             scope: scope::SessionScope::Conversation { channel_id },
@@ -12814,6 +12854,7 @@ mod error_outcome_emission_tests {
             channel_id,
             scope: session_scope.clone(),
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -12970,6 +13011,7 @@ mod error_outcome_emission_tests {
             channel_id,
             scope: scope::SessionScope::Conversation { channel_id },
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -13077,6 +13119,7 @@ mod error_outcome_emission_tests {
             channel_id,
             scope: scope::SessionScope::Conversation { channel_id },
             events: vec![BatchEvent {
+                answer_required: None,
                 edit,
                 event,
                 prompt_tag: "test".into(),
@@ -13357,6 +13400,7 @@ mod error_outcome_emission_tests {
             channel_id,
             scope: scope::SessionScope::Conversation { channel_id },
             events: vec![BatchEvent {
+                answer_required: None,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),

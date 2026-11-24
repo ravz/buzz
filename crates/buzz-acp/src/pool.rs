@@ -41,12 +41,19 @@ use crate::queue::{
     CancelReason, ContextMessage, ConversationContext, FlushBatch, PromptChannelInfo,
     PromptProfile, PromptProfileLookup, ThreadTags,
 };
-use crate::relay::{ChannelInfo, RestClient};
+use crate::relay::{AuthoredPostQueryClient, ChannelInfo, RestClient, AUTHORED_POST_QUERY_TIMEOUT};
 use crate::scope::SessionScope;
 
 /// Window within which agent activity before a hard-cap death qualifies
 /// the turn as "recently active" (eligible for requeue instead of dead-letter).
 const RECENT_ACTIVITY_WINDOW: Duration = Duration::from_secs(60);
+
+const SILENT_TURN_CONTINUATION_PROMPT: &str =
+    "[Harness-generated continuation — not a user message]\n\
+You ended your turn without posting anything to the channel. If your work \
+finished, post the result now. If you are still waiting on something, post \
+an explicit BLOCKED naming exactly what you are waiting on and what should \
+happen next. Do not end this turn silently.";
 
 /// Maximum canonical thread roots remembered by one live ACP session.
 ///
@@ -895,6 +902,10 @@ pub struct PromptContext {
     /// disables emission. This is the desktop crash-backstop signal — distinct
     /// from `heartbeat_prompt` (agent self-prompting).
     pub turn_liveness_interval: Duration,
+    /// Delay for relay persistence before each authored-post check.
+    pub(crate) silent_turn_grace: Duration,
+    /// Present in conversational mode when silent-turn continuation is enabled.
+    pub(crate) authored_post_query: Option<AuthoredPostQueryClient>,
     pub dedup_mode: DedupMode,
     pub system_prompt: Option<String>,
     /// Sanitized agent name used to compose `_meta.sessionTitle` on session/new.
@@ -937,6 +948,18 @@ pub struct PromptContext {
     /// the desktop keys per (agent, relay) pair, e.g. `session_config_captured`,
     /// mirroring the `managed_agent_runtime_lifecycle` frames.
     pub relay_url: String,
+}
+
+impl PromptContext {
+    /// Two prompt budgets and up to two relay checks while the scope is busy.
+    pub(crate) fn silent_turn_budget(&self, batch: &FlushBatch) -> Option<Duration> {
+        (self.authored_post_query.is_some() && batch.needs_answer()).then(|| {
+            self.max_turn_duration
+                .saturating_add(self.silent_turn_grace)
+                .saturating_add(AUTHORED_POST_QUERY_TIMEOUT)
+                .saturating_mul(2)
+        })
+    }
 }
 
 impl AgentPool {
@@ -2399,6 +2422,98 @@ fn send_prompt_result(
     });
 }
 
+/// Apply the bounded silent-turn policy to a normal ACP completion. A relay
+/// error leaves the post status unknown and preserves the original result.
+async fn enforce_silent_turn_continuation(
+    agent: &mut OwnedAgent,
+    session_id: &str,
+    batch: Option<&FlushBatch>,
+    ctx: &PromptContext,
+    turn_watermark: u64,
+    turn_id: &str,
+    stop_reason: StopReason,
+) -> Result<StopReason, AcpError> {
+    let (Some(batch), Some(query)) = (batch, &ctx.authored_post_query) else {
+        return Ok(stop_reason);
+    };
+    if !batch.needs_answer() || !matches!(stop_reason, StopReason::EndTurn) {
+        return Ok(stop_reason);
+    }
+
+    let scope = &batch.scope;
+    let channel_id = scope.channel_id();
+    tokio::time::sleep(ctx.silent_turn_grace).await;
+    match query.has_post_since(scope, turn_watermark).await {
+        Ok(true) => return Ok(stop_reason),
+        Ok(false) => {}
+        Err(error) => {
+            tracing::warn!(
+                target: "pool::prompt", %channel_id, %error,
+                "silent-turn authored-post query failed — leaving turn unchanged"
+            );
+            return Ok(stop_reason);
+        }
+    }
+
+    if !batch.claim_continuation() {
+        return Ok(stop_reason);
+    }
+    // Starting another ACP prompt resets its usage tracker. Record the
+    // original prompt's usage before sending the continuation.
+    let usage = agent.acp.take_turn_usage();
+    publish_agent_turn_metric(
+        ctx,
+        usage,
+        Some(channel_id),
+        session_id,
+        &format!("{turn_id}:mention"),
+        Some(acp_stop_to_core(&stop_reason)),
+    )
+    .await;
+    tracing::info!(
+        target: "pool::prompt", %channel_id, scope = %scope.telemetry_label(),
+        "mention-triggered turn ended silently — issuing one continuation"
+    );
+    let continuation = agent
+        .acp
+        .session_prompt_blocks_with_idle_timeout(
+            session_id,
+            &[SILENT_TURN_CONTINUATION_PROMPT],
+            ctx.idle_timeout,
+            ctx.max_turn_duration,
+        )
+        .await?;
+
+    if matches!(continuation, StopReason::EndTurn) {
+        tokio::time::sleep(ctx.silent_turn_grace).await;
+        match query.has_post_since(scope, turn_watermark).await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(
+                    target: "pool::prompt", %channel_id, scope = %scope.telemetry_label(),
+                    "silent-turn continuation also ended without an authored channel post; not prompting again"
+                );
+                agent.acp.observe(
+                    "silent_turn_continuation_exhausted",
+                    serde_json::json!({
+                        "channelId": channel_id,
+                        "threadRootEventId": scope.root_event_id(),
+                        "turnWatermark": turn_watermark,
+                    }),
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "pool::prompt", %channel_id, %error,
+                    "silent-turn continuation authored-post query failed — posted status unknown"
+                );
+            }
+        }
+    }
+
+    Ok(continuation)
+}
+
 /// Core async function spawned for each prompt.
 ///
 /// Lifecycle:
@@ -2431,7 +2546,9 @@ pub async fn run_prompt_task(
     // Thread conversation context requires the canonical root to distinguish
     // concurrent threads in the same channel's activity.
     let observer_thread_root = source.scope().and_then(SessionScope::root_event_id);
-    let turn_started_at = chrono::Utc::now().to_rfc3339();
+    let turn_started = chrono::Utc::now();
+    let turn_watermark = turn_started.timestamp().max(0) as u64;
+    let turn_started_at = turn_started.to_rfc3339();
     agent.acp.set_observer_context(observer::context_for_turn(
         observer_channel_id,
         None,
@@ -3215,32 +3332,34 @@ pub async fn run_prompt_task(
         prompt_label(&source)
     );
 
-    // When control_rx is Some (channel tasks), wrap the prompt in select! so
-    // the main loop can cancel, interrupt, or rotate it. Heartbeats
-    // (control_rx=None) take the simple await path — they are not controllable.
-    //
+    // Keep the same control path during the post check and continuation.
+    let prompt = async {
+        let stop_reason = agent
+            .acp
+            .session_prompt_blocks_with_idle_timeout(
+                &session_id,
+                &prompt_blocks,
+                ctx.idle_timeout,
+                ctx.max_turn_duration,
+            )
+            .await?;
+        enforce_silent_turn_continuation(
+            &mut agent,
+            &session_id,
+            batch.as_ref(),
+            &ctx,
+            turn_watermark,
+            &turn_id,
+            stop_reason,
+        )
+        .await
+    };
     let prompt_result = match control_rx {
-        None => {
-            // Heartbeat / non-cancellable path.
-            tokio::select! {
-                biased;
-                result = agent.acp.session_prompt_blocks_with_idle_timeout(
-                    &session_id,
-                    &prompt_blocks,
-                    ctx.idle_timeout,
-                    ctx.max_turn_duration,
-                ) => result,
-            }
-        }
+        None => prompt.await,
         Some(rx) => {
             tokio::select! {
                 biased;
-                result = agent.acp.session_prompt_blocks_with_idle_timeout(
-                    &session_id,
-                    &prompt_blocks,
-                    ctx.idle_timeout,
-                    ctx.max_turn_duration,
-                ) => result,
+                result = prompt => result,
                 mode = rx => {
                     let control_signal = mode.unwrap_or(ControlSignal::Cancel);
                     // Land the model switch before any cancel/requeue work: setting
@@ -3330,18 +3449,15 @@ pub async fn run_prompt_task(
                             }
                         }
                     } else {
-                        // Race 1 resolution: turn completed naturally before cancel
-                        // could fire. last_prompt_id is None — cleared by
-                        // session_prompt_with_idle_timeout() on success. The prompt
-                        // future was dropped by select! — its Ok result is gone.
+                        // The ACP prompt completed before the control signal.
+                        // This also covers a signal during either silent-turn
+                        // grace period or relay check, when no RPC needs cancel.
                         //
                         // Note: this `else` branch (last_prompt_id is None) cannot
                         // fire during the pre-prompt phase because `biased` select!
                         // polls the prompt arm first. That arm sets last_prompt_id
                         // synchronously before its first yield point, so by the time
                         // the cancel arm can win, last_prompt_id is already Some.
-                        // This branch only fires when the turn genuinely completed
-                        // and last_prompt_id was cleared by the success path.
                         //
                         // MUST send a PromptResult or the main loop deadlocks.
                         if matches!(
@@ -6984,6 +7100,7 @@ pub(crate) mod tests {
             channel_id,
             scope: SessionScope::Conversation { channel_id },
             events: vec![crate::queue::BatchEvent {
+                answer_required: None,
                 edit: None,
                 event,
                 prompt_tag: "@mention".into(),
@@ -7197,6 +7314,411 @@ pub(crate) mod tests {
         }
     }
 
+    async fn silent_turn_test_agent(
+        observer: Option<observer::ObserverHandle>,
+    ) -> (OwnedAgent, observer::ObserverHandle) {
+        let observer = observer.unwrap_or_else(observer::ObserverHandle::in_process);
+        let script = r#"import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    response = {"jsonrpc": "2.0", "id": request["id"], "result": {"stopReason": "end_turn"}}
+    print(json.dumps(response), flush=True)
+"#;
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let mut acp = AcpClient::spawn(
+            python,
+            &["-u".to_string(), "-c".to_string(), script.to_string()],
+            &[],
+            false,
+        )
+        .await
+        .expect("spawn silent-turn ACP script");
+        acp.set_observer(Some(observer.clone()), 0);
+        (
+            OwnedAgent {
+                index: 0,
+                acp,
+                state: SessionState::default(),
+                model_capabilities: None,
+                desired_model: None,
+                model_overridden: false,
+                agent_name: "silent-turn-test-agent".into(),
+                desired_model_request_id: None,
+                desired_model_pending_ack: false,
+                startup_effort: None,
+                goose_system_prompt_supported: None,
+                protocol_version: 1,
+            },
+            observer,
+        )
+    }
+
+    async fn captured_silent_turn_prompts(
+        mut agent: OwnedAgent,
+        observer: &observer::ObserverHandle,
+    ) -> Vec<serde_json::Value> {
+        agent.acp.shutdown().await;
+        observer
+            .snapshot()
+            .into_iter()
+            .filter(|event| {
+                event.kind == "acp_write"
+                    && event
+                        .payload
+                        .get("method")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("session/prompt")
+            })
+            .map(|event| event.payload)
+            .collect()
+    }
+
+    fn answer_required_batch(channel_id: Uuid) -> FlushBatch {
+        let scope = SessionScope::Thread {
+            channel_id,
+            root_event_id: "a".repeat(64),
+        };
+        let mut batch = batch_with_scope(scope, signed_event_with_tags(vec![]));
+        batch.events[0].answer_required = Some(Arc::new(true.into()));
+        batch
+    }
+
+    #[tokio::test]
+    async fn mention_turn_with_authored_post_does_not_continue() {
+        let channel_id = Uuid::new_v4();
+        let (mut agent, observer) = silent_turn_test_agent(None).await;
+        let mut ctx = make_prompt_context_no_owner();
+        let (query, mut queries) = AuthoredPostQueryClient::test_pair();
+        ctx.authored_post_query = Some(query);
+        let responder = tokio::spawn(async move {
+            let request = queries.recv().await.expect("authored-post query");
+            assert_eq!(request.scope.channel_id(), channel_id);
+            assert_eq!(request.scope.root_event_id(), Some("a".repeat(64).as_str()));
+            assert_eq!(request.since, 940);
+            request.response.send(Ok(true)).expect("query response");
+        });
+
+        let stop = enforce_silent_turn_continuation(
+            &mut agent,
+            "live-session",
+            Some(&answer_required_batch(channel_id)),
+            &ctx,
+            1_000,
+            "test-turn",
+            StopReason::EndTurn,
+        )
+        .await
+        .expect("silent-turn policy");
+
+        assert!(matches!(stop, StopReason::EndTurn));
+        responder.await.expect("query responder");
+        assert!(captured_silent_turn_prompts(agent, &observer)
+            .await
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn authored_post_query_error_fails_open_without_continuation() {
+        let channel_id = Uuid::new_v4();
+        let (mut agent, observer) = silent_turn_test_agent(None).await;
+        let mut ctx = make_prompt_context_no_owner();
+        let (query, mut queries) = AuthoredPostQueryClient::test_pair();
+        ctx.authored_post_query = Some(query);
+        let responder = tokio::spawn(async move {
+            let request = queries.recv().await.expect("authored-post query");
+            request
+                .response
+                .send(Err(crate::relay::RelayError::Timeout))
+                .expect("query response");
+        });
+
+        enforce_silent_turn_continuation(
+            &mut agent,
+            "live-session",
+            Some(&answer_required_batch(channel_id)),
+            &ctx,
+            1_000,
+            "test-turn",
+            StopReason::EndTurn,
+        )
+        .await
+        .expect("relay uncertainty must not fail the ACP turn");
+
+        responder.await.expect("query responder");
+        assert!(captured_silent_turn_prompts(agent, &observer)
+            .await
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn silent_mention_turn_gets_exactly_one_in_session_continuation() {
+        let channel_id = Uuid::new_v4();
+        let (mut agent, observer) = silent_turn_test_agent(None).await;
+        let batch = answer_required_batch(channel_id);
+        let scope = batch.scope.clone();
+        agent
+            .state
+            .sessions
+            .insert(scope.clone(), "live-session".into());
+        let mut ctx = make_prompt_context_no_owner();
+        let (relay_fixture, _, relay_task) = counting_resolver(json!([])).await;
+        ctx.rest_client = relay_fixture.rest_client;
+        ctx.channel_info = ChannelInfoResolver::new(
+            HashMap::from([(
+                channel_id,
+                ChannelInfo {
+                    name: "test".into(),
+                    channel_type: "stream".into(),
+                    description: None,
+                },
+            )]),
+            ctx.rest_client.clone(),
+        );
+        let (query, mut queries) = AuthoredPostQueryClient::test_pair();
+        ctx.authored_post_query = Some(query);
+        let responder = tokio::spawn(async move {
+            let first = queries.recv().await.expect("initial authored-post query");
+            assert_eq!(first.scope, scope);
+            first
+                .response
+                .send(Ok(false))
+                .expect("initial query response");
+            let second = queries
+                .recv()
+                .await
+                .expect("continuation authored-post query");
+            assert_eq!(second.scope, scope);
+            second
+                .response
+                .send(Ok(true))
+                .expect("continuation query response");
+        });
+
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+        let (_control_tx, control_rx) = tokio::sync::oneshot::channel();
+        timeout(
+            Duration::from_secs(10),
+            run_prompt_task(
+                agent,
+                Some(batch),
+                None,
+                Arc::new(ctx),
+                result_tx,
+                Some(control_rx),
+                "test-turn".into(),
+                crate::queue::PromptRouting::default(),
+            ),
+        )
+        .await
+        .expect("mention turn should finish");
+
+        responder.await.expect("query responder");
+        let result = result_rx.recv().await.expect("mention turn result");
+        relay_task.abort();
+        assert!(matches!(
+            result.outcome,
+            PromptOutcome::Ok(StopReason::EndTurn)
+        ));
+        let prompts = captured_silent_turn_prompts(result.agent, &observer).await;
+        assert_eq!(
+            prompts.len(),
+            2,
+            "expect the mention prompt and one continuation"
+        );
+        assert_eq!(prompts[0]["params"]["sessionId"], "live-session");
+        assert_eq!(prompts[1]["params"]["sessionId"], "live-session");
+        assert_eq!(
+            prompts[1]["params"]["prompt"][0]["text"],
+            SILENT_TURN_CONTINUATION_PROMPT
+        );
+    }
+
+    #[derive(Clone)]
+    struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("capture log lock")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for SharedLogWriter {
+        type Writer = Self;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn second_silent_turn_warns_observes_and_does_not_loop() {
+        let channel_id = Uuid::new_v4();
+        let observer = observer::ObserverHandle::in_process();
+        let (mut agent, prompt_observer) = silent_turn_test_agent(Some(observer.clone())).await;
+        let mut ctx = make_prompt_context_no_owner();
+        let (query, mut queries) = AuthoredPostQueryClient::test_pair();
+        ctx.authored_post_query = Some(query);
+        let responder = tokio::spawn(async move {
+            for _ in 0..2 {
+                let request = queries.recv().await.expect("authored-post query");
+                request.response.send(Ok(false)).expect("query response");
+            }
+            assert!(
+                timeout(Duration::from_millis(25), queries.recv())
+                    .await
+                    .is_err(),
+                "a second continuation query would prove an unbounded loop"
+            );
+        });
+        let log_bytes = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(SharedLogWriter(Arc::clone(&log_bytes)))
+            .finish();
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+        enforce_silent_turn_continuation(
+            &mut agent,
+            "live-session",
+            Some(&answer_required_batch(channel_id)),
+            &ctx,
+            1_000,
+            "test-turn",
+            StopReason::EndTurn,
+        )
+        .await
+        .expect("silent-turn policy");
+
+        responder.await.expect("query responder");
+        assert_eq!(
+            captured_silent_turn_prompts(agent, &prompt_observer)
+                .await
+                .len(),
+            1
+        );
+        assert!(observer
+            .snapshot()
+            .iter()
+            .any(|event| event.kind == "silent_turn_continuation_exhausted"));
+        let logs = String::from_utf8(log_bytes.lock().expect("capture log lock").clone())
+            .expect("logs are UTF-8");
+        assert!(logs.contains("WARN pool::prompt"), "captured logs: {logs}");
+        assert!(
+            logs.contains("not prompting again"),
+            "captured logs: {logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_mention_workflow_turn_does_not_continue() {
+        let channel_id = Uuid::new_v4();
+        let (mut agent, observer) = silent_turn_test_agent(None).await;
+        let mut ctx = make_prompt_context_no_owner();
+        let (query, mut queries) = AuthoredPostQueryClient::test_pair();
+        ctx.authored_post_query = Some(query);
+
+        enforce_silent_turn_continuation(
+            &mut agent,
+            "live-session",
+            Some(&batch_with_scope(
+                conv(channel_id),
+                signed_event_with_tags(vec![]),
+            )),
+            &ctx,
+            1_000,
+            "test-turn",
+            StopReason::EndTurn,
+        )
+        .await
+        .expect("silent-turn policy");
+
+        assert!(timeout(Duration::from_millis(25), queries.recv())
+            .await
+            .is_err());
+        assert!(captured_silent_turn_prompts(agent, &observer)
+            .await
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn authored_post_arriving_during_grace_prevents_continuation() {
+        let channel_id = Uuid::new_v4();
+        let (mut agent, observer) = silent_turn_test_agent(None).await;
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.silent_turn_grace = Duration::from_millis(75);
+        let (query, mut queries) = AuthoredPostQueryClient::test_pair();
+        ctx.authored_post_query = Some(query);
+        let started = tokio::time::Instant::now();
+        let posted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let late_post = Arc::clone(&posted);
+        let publisher = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            late_post.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let responder = tokio::spawn(async move {
+            let request = queries.recv().await.expect("post-grace authored query");
+            assert!(
+                started.elapsed() >= Duration::from_millis(60),
+                "query ran before the configured grace window"
+            );
+            request
+                .response
+                .send(Ok(posted.load(std::sync::atomic::Ordering::SeqCst)))
+                .expect("query response");
+        });
+
+        enforce_silent_turn_continuation(
+            &mut agent,
+            "live-session",
+            Some(&answer_required_batch(channel_id)),
+            &ctx,
+            1_000,
+            "test-turn",
+            StopReason::EndTurn,
+        )
+        .await
+        .expect("silent-turn policy");
+
+        publisher.await.expect("late post publisher");
+        responder.await.expect("query responder");
+        assert!(captured_silent_turn_prompts(agent, &observer)
+            .await
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn disabled_silent_turn_continuation_preserves_existing_behavior() {
+        let channel_id = Uuid::new_v4();
+        let (mut agent, observer) = silent_turn_test_agent(None).await;
+        let ctx = make_prompt_context_no_owner();
+
+        enforce_silent_turn_continuation(
+            &mut agent,
+            "live-session",
+            Some(&answer_required_batch(channel_id)),
+            &ctx,
+            1_000,
+            "test-turn",
+            StopReason::EndTurn,
+        )
+        .await
+        .expect("silent-turn policy");
+
+        assert!(captured_silent_turn_prompts(agent, &observer)
+            .await
+            .is_empty());
+    }
+
     #[tokio::test]
     async fn run_prompt_task_commits_standing_context_only_after_acp_success() {
         let capture = std::env::temp_dir().join(format!(
@@ -7357,6 +7879,7 @@ done"#
                 channel_id,
                 scope: SessionScope::Conversation { channel_id },
                 events: vec![crate::queue::BatchEvent {
+                    answer_required: None,
                     edit: None,
                     event,
                     prompt_tag: "test".into(),
@@ -7558,6 +8081,7 @@ done"#
             channel_id,
             scope: scope.clone(),
             events: vec![crate::queue::BatchEvent {
+                answer_required: None,
                 edit: None,
                 event: root,
                 prompt_tag: "@mention".into(),
@@ -7570,6 +8094,7 @@ done"#
             channel_id,
             scope: scope.clone(),
             events: vec![crate::queue::BatchEvent {
+                answer_required: None,
                 edit: None,
                 event: trigger,
                 prompt_tag: "@mention".into(),
@@ -7663,12 +8188,14 @@ done"#
             channel_id,
             scope: SessionScope::Conversation { channel_id },
             events: vec![crate::queue::BatchEvent {
+                answer_required: None,
                 edit: None,
                 event: new_event.clone(),
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
             }],
             cancelled_events: vec![crate::queue::BatchEvent {
+                answer_required: None,
                 edit: None,
                 event: carry_over.clone(),
                 prompt_tag: "test".into(),
@@ -7680,6 +8207,7 @@ done"#
             channel_id,
             scope: SessionScope::Conversation { channel_id },
             events: vec![crate::queue::BatchEvent {
+                answer_required: None,
                 edit: None,
                 event: next_event,
                 prompt_tag: "test".into(),
@@ -7838,6 +8366,7 @@ done"#
             channel_id,
             scope: SessionScope::Conversation { channel_id },
             events: vec![crate::queue::BatchEvent {
+                answer_required: None,
                 edit: None,
                 event: trigger,
                 prompt_tag: "test".into(),
@@ -8122,6 +8651,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                 root_event_id: root_id,
             },
             events: vec![crate::queue::BatchEvent {
+                answer_required: None,
                 edit: None,
                 event: trigger,
                 prompt_tag: "@mention".into(),
@@ -8176,6 +8706,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             channel_id,
             scope: SessionScope::Conversation { channel_id },
             events: vec![crate::queue::BatchEvent {
+                answer_required: None,
                 edit: None,
                 event: trigger,
                 prompt_tag: "@mention".into(),
@@ -8417,6 +8948,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             channel_id: scope.channel_id(),
             scope,
             events: vec![crate::queue::BatchEvent {
+                answer_required: None,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -8500,6 +9032,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         ]);
         let mut batch = batch_with_scope(conv(channel), current);
         batch.cancelled_events.push(crate::queue::BatchEvent {
+            answer_required: None,
             edit: None,
             event: cancelled,
             prompt_tag: "cancelled".into(),
@@ -9183,6 +9716,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             channel_id,
             scope: SessionScope::Conversation { channel_id },
             events: vec![crate::queue::BatchEvent {
+                answer_required: None,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -10453,6 +10987,8 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             idle_timeout: Duration::from_secs(60),
             max_turn_duration: Duration::from_secs(120),
             turn_liveness_interval: Duration::ZERO,
+            silent_turn_grace: Duration::ZERO,
+            authored_post_query: None,
             dedup_mode: DedupMode::Drop,
             system_prompt: None,
             session_title: None,
@@ -11123,6 +11659,7 @@ done"#
             channel_id,
             scope: conv(channel_id),
             events: vec![crate::queue::BatchEvent {
+                answer_required: None,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
