@@ -86,6 +86,8 @@ impl StopReason {
 /// Errors that can occur in the ACP client.
 #[derive(Debug, thiserror::Error)]
 pub enum AcpError {
+    #[error("Admission gate is closed")]
+    AdmissionClosed,
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -739,6 +741,19 @@ impl AcpClient {
         system_prompt: Option<SystemPromptTransport<'_>>,
         session_title: Option<&str>,
     ) -> Result<SessionNewResponse, AcpError> {
+        self.session_new_with_max_turns(cwd, mcp_servers, system_prompt, session_title, 0)
+            .await
+    }
+
+    /// Create a session with an optional Claude SDK inner-turn cap in metadata.
+    pub(crate) async fn session_new_with_max_turns(
+        &mut self,
+        cwd: &str,
+        mcp_servers: Vec<McpServer>,
+        system_prompt: Option<SystemPromptTransport<'_>>,
+        session_title: Option<&str>,
+        claude_max_inner_turns: u64,
+    ) -> Result<SessionNewResponse, AcpError> {
         let mut params = serde_json::json!({
             "cwd": cwd,
             "mcpServers": mcp_servers,
@@ -764,6 +779,10 @@ impl AcpClient {
             // Merge — claude-agent-acp spreads these into the CLI's argv.
             params["_meta"]["claudeCode"]["options"]["extraArgs"]["thinking-display"] =
                 serde_json::Value::String("summarized".to_owned());
+        }
+        if claude_max_inner_turns != 0 {
+            params["_meta"]["claudeCode"]["options"]["maxTurns"] =
+                serde_json::json!(claude_max_inner_turns);
         }
         let result = self.send_request("session/new", params).await?;
         let session_id = result["sessionId"]
@@ -1038,6 +1057,13 @@ impl AcpClient {
     /// Idempotent — safe to call when `steer_rx` is already `None`.
     pub fn clear_steer_rx(&mut self) {
         self.steer_rx = None;
+    }
+
+    /// Set the current turn's steer mailbox aside during an internal prompt.
+    pub(crate) fn take_steer_rx(
+        &mut self,
+    ) -> Option<tokio::sync::mpsc::Receiver<crate::pool::SteerRequest>> {
+        self.steer_rx.take()
     }
 
     /// Returns `true` if no steer receiver is currently installed.

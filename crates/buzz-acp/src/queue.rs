@@ -113,6 +113,8 @@ pub struct QueuedEvent {
     /// An unused continuation for a mention-required trigger. The same flag
     /// is shared by the queued, in-flight, and panic-recovery copies.
     pub(crate) answer_required: Option<Arc<AtomicBool>>,
+    /// A relay-authored workflow accepted without a required mention.
+    pub(crate) scheduled_workflow: bool,
     /// Original-message routing for a kind:40003 edit, resolved once at
     /// admission. `None` for ordinary events and for edits whose original
     /// could not be fetched (routing then falls back to the edit target id).
@@ -125,6 +127,7 @@ impl QueuedEvent {
             event: self.event,
             prompt_tag: self.prompt_tag,
             answer_required: self.answer_required,
+            scheduled_workflow: self.scheduled_workflow,
             received_at: self.received_at,
             edit: self.edit,
         }
@@ -139,6 +142,8 @@ pub struct BatchEvent {
     pub received_at: Instant,
     /// See [`QueuedEvent::answer_required`].
     pub(crate) answer_required: Option<Arc<AtomicBool>>,
+    /// See [`QueuedEvent::scheduled_workflow`].
+    pub(crate) scheduled_workflow: bool,
     /// See [`QueuedEvent::edit`].
     pub edit: Option<ResolvedEdit>,
 }
@@ -289,6 +294,15 @@ pub struct FlushBatch {
 }
 
 impl FlushBatch {
+    pub(crate) fn is_scheduled_workflow_turn(&self) -> bool {
+        !self.events.is_empty()
+            && self
+                .events
+                .iter()
+                .chain(&self.cancelled_events)
+                .all(|event| event.scheduled_workflow)
+    }
+
     fn answer_requirements(&self) -> impl Iterator<Item = &AtomicBool> {
         self.events
             .iter()
@@ -463,12 +477,21 @@ impl EventQueue {
     ///
     /// Returns `true` if the event was accepted, `false` if dropped.
     pub fn push(&mut self, event: QueuedEvent) -> bool {
+        self.push_with_admission(event, false)
+    }
+
+    pub(crate) fn push_with_admission(
+        &mut self,
+        event: QueuedEvent,
+        admission_blocked: bool,
+    ) -> bool {
         debug_assert_eq!(
             event.scope.channel_id(),
             event.channel_id,
             "QueuedEvent.scope must belong to its channel_id"
         );
-        if matches!(self.dedup_mode, DedupMode::Drop)
+        if !admission_blocked
+            && matches!(self.dedup_mode, DedupMode::Drop)
             && self.in_flight_scopes.contains(&event.scope)
         {
             tracing::debug!(
@@ -784,6 +807,7 @@ impl EventQueue {
                 prompt_tag: be.prompt_tag,
                 received_at: be.received_at, // preserve original timestamp (#46)
                 answer_required: be.answer_required,
+                scheduled_workflow: be.scheduled_workflow,
                 edit: be.edit,
             });
         }
@@ -850,6 +874,7 @@ impl EventQueue {
                 prompt_tag: be.prompt_tag,
                 received_at: be.received_at,
                 answer_required: be.answer_required,
+                scheduled_workflow: be.scheduled_workflow,
                 edit: be.edit,
             });
         }
@@ -2760,6 +2785,7 @@ mod tests {
     fn make_queued(channel_id: Uuid, content: &str) -> QueuedEvent {
         QueuedEvent {
             answer_required: None,
+            scheduled_workflow: false,
             edit: None,
             channel_id,
             scope: conv(channel_id),
@@ -2773,6 +2799,7 @@ mod tests {
     fn make_queued_at(channel_id: Uuid, content: &str, age: Duration) -> QueuedEvent {
         QueuedEvent {
             answer_required: None,
+            scheduled_workflow: false,
             edit: None,
             channel_id,
             scope: conv(channel_id),
@@ -2796,6 +2823,7 @@ mod tests {
             .unwrap();
         QueuedEvent {
             answer_required: None,
+            scheduled_workflow: false,
             edit: None,
             channel_id,
             scope: conv(channel_id),
@@ -2825,6 +2853,7 @@ mod tests {
     fn make_scoped(scope: SessionScope, content: &str) -> QueuedEvent {
         QueuedEvent {
             answer_required: None,
+            scheduled_workflow: false,
             edit: None,
             channel_id: scope.channel_id(),
             scope,
@@ -3157,6 +3186,7 @@ mod tests {
             scope: conv(ch),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event,
                 prompt_tag: "@mention".into(),
@@ -3190,6 +3220,7 @@ mod tests {
             scope: conv(ch),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event: make_event("the new message"),
                 prompt_tag: "@mention".into(),
@@ -3197,6 +3228,7 @@ mod tests {
             }],
             cancelled_events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event: make_event("the original task"),
                 prompt_tag: "@mention".into(),
@@ -3333,6 +3365,7 @@ mod tests {
             events: vec![
                 BatchEvent {
                     answer_required: None,
+                    scheduled_workflow: false,
                     edit: None,
                     event: make_event("new one"),
                     prompt_tag: "@mention".into(),
@@ -3340,6 +3373,7 @@ mod tests {
                 },
                 BatchEvent {
                     answer_required: None,
+                    scheduled_workflow: false,
                     edit: None,
                     event: make_event("new two"),
                     prompt_tag: "@mention".into(),
@@ -3348,6 +3382,7 @@ mod tests {
             ],
             cancelled_events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event: make_event("original"),
                 prompt_tag: "@mention".into(),
@@ -3396,6 +3431,7 @@ mod tests {
             scope: conv(ch),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event: steering,
                 prompt_tag: "@mention".into(),
@@ -3403,6 +3439,7 @@ mod tests {
             }],
             cancelled_events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event: original,
                 prompt_tag: "@mention".into(),
@@ -3573,6 +3610,7 @@ mod tests {
             events: vec![
                 BatchEvent {
                     answer_required: None,
+                    scheduled_workflow: false,
                     edit: None,
                     event: e1,
                     prompt_tag: "tag-a".into(),
@@ -3580,6 +3618,7 @@ mod tests {
                 },
                 BatchEvent {
                     answer_required: None,
+                    scheduled_workflow: false,
                     edit: None,
                     event: e2,
                     prompt_tag: "tag-b".into(),
@@ -3587,6 +3626,7 @@ mod tests {
                 },
                 BatchEvent {
                     answer_required: None,
+                    scheduled_workflow: false,
                     edit: None,
                     event: e3,
                     prompt_tag: "tag-c".into(),
@@ -3619,6 +3659,7 @@ mod tests {
             scope: conv(ch),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -3645,6 +3686,7 @@ mod tests {
             scope: conv(ch),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -3680,6 +3722,7 @@ mod tests {
             scope: conv(ch),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -3713,6 +3756,7 @@ mod tests {
             scope: conv(ch),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -3743,6 +3787,7 @@ mod tests {
             scope: conv(ch),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -3770,6 +3815,7 @@ mod tests {
             scope: conv(ch),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -3834,6 +3880,7 @@ mod tests {
             scope: conv(ch),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event: make_event("hello"),
                 prompt_tag: "test".into(),
@@ -3890,6 +3937,7 @@ mod tests {
             scope: conv(ch),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -3931,6 +3979,7 @@ mod tests {
             scope: conv(ch),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -4161,6 +4210,7 @@ mod tests {
 
         q.push(QueuedEvent {
             answer_required: None,
+            scheduled_workflow: false,
             edit: None,
             channel_id: ch,
             scope: conv(ch),
@@ -4195,6 +4245,7 @@ mod tests {
             scope: scope.clone(),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event: make_event("the follow-up"),
                 prompt_tag: "@mention".into(),
@@ -4202,6 +4253,7 @@ mod tests {
             }],
             cancelled_events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event: make_event("the original request"),
                 prompt_tag: "@mention".into(),
@@ -4528,6 +4580,7 @@ mod tests {
             scope: conv(ch),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -4564,6 +4617,7 @@ mod tests {
             scope: conv(ch),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event,
                 prompt_tag: "dm".into(),
@@ -4614,6 +4668,7 @@ mod tests {
                         scope: SessionScope::derive(policy, channel_id, is_dm, event),
                         events: vec![BatchEvent {
                             answer_required: None,
+                            scheduled_workflow: false,
                             edit: None,
                             event: event.clone(),
                             prompt_tag: "@mention".into(),
@@ -4698,6 +4753,7 @@ mod tests {
             scope: conv(ch),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event,
                 prompt_tag: "@mention".into(),
@@ -4727,6 +4783,7 @@ mod tests {
             scope: conv(ch),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event,
                 prompt_tag: "@mention".into(),
@@ -4839,6 +4896,7 @@ mod tests {
         let root_b = "b".repeat(64);
         let reply = |content: &str, root: &str| BatchEvent {
             answer_required: None,
+            scheduled_workflow: false,
             edit: None,
             event: make_event_with_tags(
                 content,
@@ -4917,6 +4975,7 @@ mod tests {
             scope: conv(ch),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event,
                 prompt_tag: "dm".into(),
@@ -4976,6 +5035,7 @@ mod tests {
             scope: conv(ch),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event,
                 prompt_tag: "@mention".into(),
@@ -5170,6 +5230,7 @@ mod tests {
         ]);
         let in_thread = |keys: &Keys, content: &str| BatchEvent {
             answer_required: None,
+            scheduled_workflow: false,
             edit: None,
             event: EventBuilder::new(Kind::Custom(9), content)
                 .tags([
@@ -5252,6 +5313,7 @@ mod tests {
             scope: conv(ch),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event,
                 prompt_tag: "dm".into(),
@@ -5325,6 +5387,7 @@ mod tests {
             scope: conv(ch),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -5361,6 +5424,7 @@ mod tests {
             scope: conv(ch),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event: make_event("follow up"),
                 prompt_tag: "dm".into(),
@@ -5414,6 +5478,7 @@ mod tests {
             scope: conv(ch),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event,
                 prompt_tag: "dm".into(),
@@ -5459,6 +5524,7 @@ mod tests {
             scope: conv(ch),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -5486,6 +5552,7 @@ mod tests {
             scope: conv(ch),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -5512,6 +5579,7 @@ mod tests {
             scope: conv(ch),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -5548,6 +5616,7 @@ mod tests {
             None,
             &BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event: direct_event,
                 prompt_tag: "test".into(),
@@ -5577,6 +5646,7 @@ mod tests {
             None,
             &BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event: nested_event,
                 prompt_tag: "test".into(),
@@ -5946,6 +6016,7 @@ mod tests {
             scope: conv(ch),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event,
                 prompt_tag: "@mention".into(),
@@ -5991,6 +6062,7 @@ mod tests {
             scope: conv(ch),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event,
                 prompt_tag: "@mention".into(),
@@ -6030,6 +6102,7 @@ mod tests {
             scope: conv(ch),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -6062,6 +6135,7 @@ mod tests {
             scope: conv(ch),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -6109,6 +6183,7 @@ mod tests {
             scope: conv(ch),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event,
                 prompt_tag: "@mention".into(),
@@ -6148,6 +6223,7 @@ mod tests {
             scope: conv(ch),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event,
                 prompt_tag: "@mention".into(),
@@ -6187,6 +6263,7 @@ mod tests {
             events: vec![
                 BatchEvent {
                     answer_required: None,
+                    scheduled_workflow: false,
                     edit: None,
                     event: plain,
                     prompt_tag: "test".into(),
@@ -6194,6 +6271,7 @@ mod tests {
                 },
                 BatchEvent {
                     answer_required: None,
+                    scheduled_workflow: false,
                     edit: None,
                     event: threaded,
                     prompt_tag: "@mention".into(),
@@ -6229,6 +6307,7 @@ mod tests {
             events: vec![
                 BatchEvent {
                     answer_required: None,
+                    scheduled_workflow: false,
                     edit: None,
                     event: threaded,
                     prompt_tag: "@mention".into(),
@@ -6236,6 +6315,7 @@ mod tests {
                 },
                 BatchEvent {
                     answer_required: None,
+                    scheduled_workflow: false,
                     edit: None,
                     event: plain,
                     prompt_tag: "test".into(),
@@ -6267,6 +6347,7 @@ mod tests {
             scope: conv(channel_id),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event: make_event(content),
                 prompt_tag: "test".into(),
@@ -6346,6 +6427,7 @@ mod tests {
         let mut multi = make_single_batch("@Eva /init");
         multi.events.push(BatchEvent {
             answer_required: None,
+            scheduled_workflow: false,
             edit: None,
             event: make_event("another message"),
             prompt_tag: "test".into(),
@@ -6357,6 +6439,7 @@ mod tests {
         let mut cancelled = make_single_batch("@Eva /init");
         cancelled.cancelled_events.push(BatchEvent {
             answer_required: None,
+            scheduled_workflow: false,
             edit: None,
             event: make_event("interrupted"),
             prompt_tag: "test".into(),
@@ -6574,6 +6657,7 @@ mod tests {
             scope: conv(ch),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event: make_event("hi"),
                 prompt_tag: "test".into(),
@@ -6606,6 +6690,7 @@ mod tests {
             scope: conv(ch),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event: make_event("hi"),
                 prompt_tag: "test".into(),
@@ -6637,6 +6722,7 @@ mod tests {
             scope: conv(ch),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event: make_event("hi"),
                 prompt_tag: "test".into(),
@@ -6869,6 +6955,7 @@ mod tests {
     fn queued_edit(channel_id: Uuid, target: &str, edit: Option<ResolvedEdit>) -> QueuedEvent {
         QueuedEvent {
             answer_required: None,
+            scheduled_workflow: false,
             edit,
             channel_id,
             scope: conv(channel_id),
@@ -6885,6 +6972,7 @@ mod tests {
             scope: conv(channel_id),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
@@ -7295,6 +7383,7 @@ mod tests {
             scope: conv(ch),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),

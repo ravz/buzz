@@ -229,10 +229,7 @@ pub(crate) async fn run() -> i32 {
         }
     };
     let startup = runtime.startup(None);
-    let duration = Duration::from_millis(
-        task.max_duration_ms
-            .min(config.max_turn_duration_secs.saturating_mul(1000)),
-    );
+    let duration = Duration::from_millis(task.max_duration_ms);
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
     let execution = isolated_execution::execute(&startup, &ctx, &task.prompt, duration, cancel_rx);
     tokio::pin!(execution);

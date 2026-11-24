@@ -418,6 +418,9 @@ pub struct CliArgs {
           value_parser = clap::value_parser!(u32))]
     pub max_turns_per_session: u32,
 
+    #[command(flatten)]
+    pub(crate) usage_guards: crate::usage_guard::Settings,
+
     /// Disable automatic presence (online/offline) status.
     #[arg(long, env = "BUZZ_ACP_NO_PRESENCE")]
     pub no_presence: bool,
@@ -601,6 +604,7 @@ pub struct Config {
     pub context_message_limit: u32,
     /// Maximum turns per session before proactive rotation. 0 = disabled.
     pub max_turns_per_session: u32,
+    pub(crate) usage_guards: crate::usage_guard::Settings,
     pub presence_enabled: bool,
     pub typing_enabled: bool,
     /// Whether NIP-AE agent core memory injection is enabled. When false,
@@ -988,6 +992,7 @@ impl Config {
     /// tests can construct `CliArgs` via `CliArgs::try_parse_from` and exercise the full
     /// validation path without going through process args.
     pub fn from_args(mut args: CliArgs) -> Result<Self, ConfigError> {
+        args.usage_guards.validate()?;
         let keys = Keys::parse(&args.private_key)?;
         // Best-effort zeroize: overwrite the raw private key string to reduce
         // exposure via core dumps or heap inspection (#41). Without the `zeroize`
@@ -1241,6 +1246,7 @@ impl Config {
             config_path: args.config,
             context_message_limit: args.context_message_limit,
             max_turns_per_session: args.max_turns_per_session,
+            usage_guards: args.usage_guards,
             presence_enabled: !args.no_presence,
             typing_enabled: !args.no_typing,
             memory_enabled: args.memory && !args.no_memory,
@@ -1285,7 +1291,7 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} session_policy={} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} session_policy={} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{} {}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1309,6 +1315,7 @@ impl Config {
             self.permission_mode,
             respond_to_detail,
             allowed_respond_to_detail,
+            self.usage_guards.summary(),
         )
     }
 }
@@ -1624,6 +1631,7 @@ mod tests {
             config_path: PathBuf::from("./buzz-acp.toml"),
             context_message_limit: 12,
             max_turns_per_session: 0,
+            usage_guards: Default::default(),
             presence_enabled: true,
             typing_enabled: true,
             memory_enabled: true,

@@ -118,6 +118,7 @@ fn make_prompt_context(
         channel_info: pool::ChannelInfoResolver::new(channels, rest_client),
         context_message_limit: config.context_message_limit,
         max_turns_per_session: config.max_turns_per_session,
+        usage_guard: crate::usage_guard::UsageGuard::new(config.usage_guards.clone()),
         permission_mode: config.permission_mode,
         agent_keys: config.keys.clone(),
         agent_owner_pubkey: resolve_agent_owner(config)

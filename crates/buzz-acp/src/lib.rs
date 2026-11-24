@@ -24,6 +24,7 @@ use runtime::{AgentRuntime, PoolStartup, SessionMode};
 mod scope;
 mod setup_mode;
 mod usage;
+mod usage_guard;
 
 pub use usage::TurnUsage;
 
@@ -554,11 +555,16 @@ mod inbound_author_gate {
     pub(crate) struct AuthorizedListenerEvent {
         buzz_event: relay::BuzzEvent,
         effective_author: String,
+        relay_workflow: bool,
     }
 
     impl AuthorizedListenerEvent {
         pub(crate) fn into_parts(self) -> (relay::BuzzEvent, String) {
             (self.buzz_event, self.effective_author)
+        }
+
+        pub(crate) fn is_relay_workflow(&self) -> bool {
+            self.relay_workflow
         }
     }
 
@@ -751,9 +757,21 @@ mod inbound_author_gate {
                 );
                 return None;
             }
+            let event = &buzz_event.event;
+            let relay_workflow = event
+                .tags
+                .iter()
+                .any(|tag| tag.as_slice() == ["buzz:workflow", "true"])
+                && self
+                    .relay_self
+                    .as_deref()
+                    .and_then(|key| nostr::PublicKey::from_hex(key).ok())
+                    == Some(event.pubkey)
+                && event.verify().is_ok();
             Some(AuthorizedListenerEvent {
                 buzz_event,
                 effective_author: decision.effective_author,
+                relay_workflow,
             })
         }
 
@@ -789,6 +807,7 @@ struct NormalListenerIngress {
     effective_author: String,
     prompt_tag: String,
     answer_required: bool,
+    scheduled_workflow: bool,
     /// Original-message routing for an admitted edit; see
     /// [`NormalListenerIngress::resolve_edit_routing`].
     edit: Option<queue::ResolvedEdit>,
@@ -800,6 +819,7 @@ impl AuthorizedNormalListenerEvent {
         rules: &[SubscriptionRule],
         agent_pubkey_hex: &str,
     ) -> Option<NormalListenerIngress> {
+        let relay_workflow = self.0.is_relay_workflow();
         let (buzz_event, effective_author) = self.0.into_parts();
         let matched = filter::match_event(
             &buzz_event.event,
@@ -813,6 +833,7 @@ impl AuthorizedNormalListenerEvent {
             effective_author,
             prompt_tag: matched.prompt_tag,
             answer_required: matched.require_mention,
+            scheduled_workflow: relay_workflow && !matched.require_mention,
             edit: None,
         })
     }
@@ -916,12 +937,14 @@ impl NormalListenerIngress {
         queue: &mut EventQueue,
         session_scope: scope::SessionScope,
         channel_is_dm: bool,
+        admission_blocked: bool,
     ) -> QueuedNormalListenerEvent {
         let Self {
             buzz_event,
             effective_author,
             prompt_tag,
             answer_required,
+            scheduled_workflow,
             edit,
         } = self;
         let reaction_target_id = queue::reaction_target_id(&buzz_event.event);
@@ -931,18 +954,25 @@ impl NormalListenerIngress {
             prompt_tag: prompt_tag.clone(),
             received_at,
             answer_required: None,
+            scheduled_workflow,
             edit: edit.clone(),
         };
         let channel_id = buzz_event.channel_id;
-        let accepted = queue.push(QueuedEvent {
+        let queued_event = QueuedEvent {
             channel_id,
             scope: session_scope.clone(),
             event: buzz_event.event,
             received_at,
             prompt_tag,
             answer_required: answer_required.then(|| Arc::new(true.into())),
+            scheduled_workflow,
             edit,
-        });
+        };
+        let accepted = if admission_blocked {
+            queue.push_with_admission(queued_event, true)
+        } else {
+            queue.push(queued_event)
+        };
         QueuedNormalListenerEvent {
             accepted,
             scope: session_scope,
@@ -2898,6 +2928,10 @@ async fn run_harness(
     let config = runtime.config();
 
     tracing::info!("buzz-acp starting: {}", config.summary());
+    let startup_delay = config.usage_guards.startup_delay(&config.keys.public_key());
+    if !startup_delay.is_zero() {
+        tokio::time::sleep(startup_delay).await;
+    }
 
     let observer = config
         .relay_observer
@@ -3088,8 +3122,10 @@ async fn run_harness(
 
     let runtime_start_nonce = std::env::var("BUZZ_MANAGED_AGENT_START_NONCE").unwrap_or_default();
     let dedup_mode = config.dedup_mode;
-    let mut queue =
-        EventQueue::new(dedup_mode).with_in_flight_deadline(config.max_turn_duration_secs);
+    let queue_turn_secs = config
+        .max_turn_duration_secs
+        .max(config.usage_guards.claude_max_duration_secs);
+    let mut queue = EventQueue::new(dedup_mode).with_in_flight_deadline(queue_turn_secs);
 
     // Online means the harness can receive work, not merely that its socket is
     // connected. Publishing after channel subscriptions gives desktop callers
@@ -3383,7 +3419,8 @@ async fn run_harness(
         while respawn_tasks.join_next().now_or_never().flatten().is_some() {}
         // Retry deadlines are actionable only with idle capacity. A busy pool
         // wakes on its result/respawn instead of spinning on an expired retry.
-        let retry_at = if pool_ready && pool.any_idle() {
+        let idle_admitted = pool_ready && pool.any_admitted(&ctx);
+        let retry_at = if idle_admitted {
             queue.next_retry_deadline()
         } else {
             None
@@ -3392,7 +3429,20 @@ async fn run_harness(
 
         // Borrow result_rx and join_set simultaneously via split-borrow helper.
         pool.retain_held_scopes(|scope| queue.has_pending_scope(scope));
-        let hold_deadline = pool.next_hold_deadline(pool::HOLD_BUSY_OWNER_TIMEOUT);
+        let hold_deadline = idle_admitted
+            .then(|| pool.next_hold_deadline(pool::HOLD_BUSY_OWNER_TIMEOUT))
+            .flatten();
+        let admission_retry = if pool_ready
+            && ctx.usage_guard.settings.has_admission_file()
+            && pool.any_idle()
+            && queue.has_flushable_work()
+        {
+            // A file can reopen without any relay traffic or worker activity.
+            Some(tokio::time::Instant::now() + Duration::from_secs(1))
+        } else {
+            None
+        };
+        let dispatch_deadline = hold_deadline.into_iter().chain(admission_retry).min();
         let pool_event: Option<PoolEvent> = {
             let (result_rx, join_set) = pool.rx_and_join_set();
             tokio::select! {
@@ -3442,7 +3492,7 @@ async fn run_harness(
                         _ => std::future::pending().await,
                     }
                 } => None,
-                _ = pool::AgentPool::wait_for_hold_deadline(hold_deadline), if pool_ready => {
+                _ = pool::AgentPool::wait_for_hold_deadline(dispatch_deadline), if pool_ready => {
                     Some(PoolEvent::HoldDeadline)
                 },
                 Some(Err(error)) = wake_tasks.join_next(), if !wake_tasks.is_empty() => {
@@ -3813,7 +3863,8 @@ async fn run_harness(
                                 policy = %config.session_policy,
                                 "admitted event — resolved session scope"
                             );
-                            let queued = ingress.push(&mut queue, session_scope, channel_is_dm);
+                            let admission_blocked = pool.scope_admission_blocked(&ctx, &session_scope);
+                            let queued = ingress.push(&mut queue, session_scope, channel_is_dm, admission_blocked);
                             // 👀 — immediate "seen" reaction, only if the event
                             // was actually queued (not dropped by DedupMode::Drop).
                             // Fire-and-forget: on rare fast-failure paths the
@@ -3824,13 +3875,15 @@ async fn run_harness(
                             // retains its verified author, resolved scope, and
                             // event data through the optional steer/interrupt
                             // decision.
-                            queued.steer_or_interrupt(
-                                config.multiple_event_handling,
-                                owner_cache.get(),
-                                &mut pool,
-                                &mut queue,
-                                &steer_ack_tx,
-                            );
+                            if !admission_blocked {
+                                queued.steer_or_interrupt(
+                                    config.multiple_event_handling,
+                                    owner_cache.get(),
+                                    &mut pool,
+                                    &mut queue,
+                                    &steer_ack_tx,
+                                );
+                            }
                             if pool_ready {
                                 for (scope, thread_tags) in
                                     dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity, observer.as_ref())
@@ -3861,7 +3914,10 @@ async fn run_harness(
                         last_activity,
                         tokio::time::Instant::now(),
                         inactivity_bound,
-                        queue.has_in_flight() || heartbeat_in_flight,
+                        queue.has_in_flight()
+                            || heartbeat_in_flight
+                            || (ctx.usage_guard.settings.has_admission_file()
+                                && queue.has_undispatched_work()),
                     ) {
                         tracing::info!(
                             inactivity_seconds = config.exit_after_inactivity_secs,
@@ -4224,8 +4280,10 @@ async fn run_harness(
                         .values()
                         .find(|meta| meta.scope.as_ref() == Some(&scope))
                         .and_then(|meta| meta.recoverable_batch.as_ref())
-                        .and_then(|batch| ctx.silent_turn_budget(batch))
-                        .unwrap_or(ctx.max_turn_duration);
+                        .and_then(|batch| {
+                            ctx.silent_turn_budget(batch, Duration::from_secs(queue_turn_secs))
+                        })
+                        .unwrap_or(Duration::from_secs(queue_turn_secs));
                     queue.extend_in_flight_deadline(&scope, budget.as_secs());
                     if !pool.record_successful_steer(&scope, event_id.clone(), session_id.clone()) {
                         tracing::warn!(
@@ -4833,6 +4891,7 @@ mod try_native_steer_fallback_log_tests {
             abort.id(),
             TaskMeta {
                 agent_index: 0,
+                claude: false,
                 channel_id: Some(busy_scope.channel_id()),
                 scope: Some(busy_scope),
                 turn_id: "t".into(),
@@ -4858,6 +4917,7 @@ mod try_native_steer_fallback_log_tests {
         assert!(
             queue.push(QueuedEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 channel_id: Uuid::nil(),
                 scope: busy_scope.clone(),
                 event: event.clone(),
@@ -4877,6 +4937,7 @@ mod try_native_steer_fallback_log_tests {
                 busy_scope.clone(),
                 queue::BatchEvent {
                     answer_required: None,
+                    scheduled_workflow: false,
                     event,
                     prompt_tag: "mention".into(),
                     received_at: std::time::Instant::now(),
@@ -5016,6 +5077,9 @@ fn dispatch_pending(
     // measured against the same instant.
     let now = tokio::time::Instant::now();
     loop {
+        if ctx.usage_guard.settings.has_admission_file() && !pool.any_admitted(ctx) {
+            break;
+        }
         let batch = match queue.flush_next() {
             Some(b) => b,
             None => break,
@@ -5073,7 +5137,7 @@ fn dispatch_pending(
         // thread's provider session so a temporarily busy worker cannot cause
         // another to open a duplicate session for the same thread.
         let affinity_hit = pool.has_session_for(&scope);
-        let mut agent = match pool.try_claim(Some(&scope)) {
+        let mut agent = match pool.try_claim(Some(&scope), |agent| agent.admits_turn(ctx)) {
             Some(a) => a,
             None => {
                 let pending = queue.pending_channels();
@@ -5112,11 +5176,16 @@ fn dispatch_pending(
         tracing::debug!(agent = agent.index, channel = %channel_id, scope = %scope.telemetry_label(), affinity_hit, "agent_claimed");
 
         let close_budget = agent.abandoned_session_close_budget();
-        let silent_turn_budget = ctx.silent_turn_budget(&batch);
-        if !close_budget.is_zero() || silent_turn_budget.is_some() {
+        let max_duration = ctx.prompt_duration(&agent);
+        let compact_budget = agent
+            .compaction_budget(&scope, max_duration)
+            .saturating_add(agent.initial_reduction_budget(ctx, &scope));
+        let silent_turn_budget = ctx.silent_turn_budget(&batch, max_duration);
+        if !close_budget.is_zero() || !compact_budget.is_zero() || silent_turn_budget.is_some() {
             let budget = silent_turn_budget
-                .unwrap_or(ctx.max_turn_duration)
-                .saturating_add(close_budget);
+                .unwrap_or(max_duration)
+                .saturating_add(close_budget)
+                .saturating_add(compact_budget);
             queue.extend_in_flight_deadline(&scope, budget.as_secs());
         }
         let recoverable_batch = match ctx.dedup_mode {
@@ -5127,6 +5196,7 @@ fn dispatch_pending(
         let result_tx = pool.result_tx();
         let ctx_clone = Arc::clone(ctx);
         let agent_index = agent.index;
+        let claude = agent.is_claude();
 
         // Mid-turn non-cancelling steer seam: install the per-turn steer
         // receiver on the read loop so the main loop's mode-gate fork
@@ -5176,6 +5246,7 @@ fn dispatch_pending(
             abort_handle.id(),
             pool::TaskMeta {
                 agent_index,
+                claude,
                 channel_id: Some(channel_id),
                 scope: Some(scope.clone()),
                 turn_id,
@@ -5313,6 +5384,13 @@ fn handle_prompt_result(
     }
     let before = pool.task_map().len();
     let agent_index = result.agent.index;
+    let max_turn_duration_secs = config
+        .usage_guards
+        .max_duration(
+            result.agent.is_claude(),
+            Duration::from_secs(config.max_turn_duration_secs),
+        )
+        .as_secs();
     let successful_steer_deliveries = pool
         .task_map()
         .values()
@@ -5362,7 +5440,9 @@ fn handle_prompt_result(
         // Don't requeue batches for channels the agent was removed from —
         // those events are stale and should be silently dropped.
         if !removed_channels.contains(&batch.channel_id) {
-            if matches!(
+            if matches!(result.outcome, PromptOutcome::AdmissionBlocked) {
+                queue.requeue_preserve_timestamps(batch);
+            } else if matches!(
                 result.outcome,
                 PromptOutcome::Cancelled | PromptOutcome::CancelDrainTimeout(_)
             ) {
@@ -5396,7 +5476,7 @@ fn handle_prompt_result(
                 );
                 let content = format!(
                     "⚠️ I couldn't process the last request (the turn exceeded the maximum duration ({}s)). Please re-send if it's still needed.",
-                    config.max_turn_duration_secs
+                    max_turn_duration_secs
                 );
                 spawn_failure_notice(rest_client, &batch, content);
                 hard_timeout_fate_suffix = Some(" — dead-lettered (no recent activity)");
@@ -5414,7 +5494,7 @@ fn handle_prompt_result(
                 if let Some(dead) = queue.requeue(batch) {
                     let content = format!(
                         "⚠️ I couldn't process the last request after multiple retries (the turn exceeded the maximum duration ({}s)). Please re-send if it's still needed.",
-                        config.max_turn_duration_secs
+                        max_turn_duration_secs
                     );
                     spawn_failure_notice(rest_client, &dead, content);
                     hard_timeout_fate_suffix = Some(" — dead-lettered (retry budget exhausted)");
@@ -5495,6 +5575,7 @@ fn handle_prompt_result(
         PromptOutcome::Ok(_) => "ok",
         PromptOutcome::Error(_) => "error",
         PromptOutcome::ProjectContextIndeterminate(_) => "project_context_indeterminate",
+        PromptOutcome::AdmissionBlocked => "admission_blocked",
         PromptOutcome::Timeout(TimeoutKind::Idle) => "idle_timeout",
         PromptOutcome::Timeout(TimeoutKind::Hard { .. }) => "hard_timeout",
         PromptOutcome::AgentExited => "exited",
@@ -5564,7 +5645,7 @@ fn handle_prompt_result(
                     let suffix = hard_timeout_fate_suffix.unwrap_or(" (no batch to retry)");
                     format!(
                         "Agent turn exceeded the maximum duration ({}s){}",
-                        config.max_turn_duration_secs, suffix
+                        max_turn_duration_secs, suffix
                     )
                 }
                 _ => "Agent session timed out due to inactivity".to_string(),
@@ -5643,13 +5724,13 @@ fn handle_prompt_result(
         // No respawn, no retry penalty. The cancelled batch was already stored
         // via requeue_as_cancelled() above and will be merged into the next
         // FlushBatch by flush_next().
-        PromptOutcome::Cancelled => {
+        PromptOutcome::Cancelled | PromptOutcome::AdmissionBlocked => {
             tracing::debug!(
                 agent = agent_index,
                 outcome = outcome_label,
                 configured_model = %harness_configured_model,
                 pid = harness_pid,
-                "agent_returned (cancelled)"
+                "agent_returned"
             );
             pool.return_agent(result.agent);
         }
@@ -5877,7 +5958,7 @@ fn dispatch_heartbeat(
     if *heartbeat_in_flight {
         return;
     }
-    let agent = match pool.try_claim(None) {
+    let agent = match pool.try_claim(None, |agent| agent.admits_turn(ctx)) {
         Some(a) => a,
         None => return,
     };
@@ -5889,6 +5970,7 @@ fn dispatch_heartbeat(
     let result_tx = pool.result_tx();
     let ctx_clone = Arc::clone(ctx);
     let agent_index = agent.index;
+    let claude = agent.is_claude();
     let turn_id = Uuid::new_v4().to_string();
     let task_turn_id = turn_id.clone();
 
@@ -5910,6 +5992,7 @@ fn dispatch_heartbeat(
         abort_handle.id(),
         pool::TaskMeta {
             agent_index,
+            claude,
             channel_id: None,
             scope: None,
             turn_id,
@@ -6725,6 +6808,7 @@ mod owner_control_command_tests {
             abort_handle.id(),
             pool::TaskMeta {
                 agent_index: 0,
+                claude: false,
                 channel_id: Some(channel_id),
                 scope: Some(scope::SessionScope::Conversation { channel_id }),
                 turn_id: "test-turn-id".to_string(),
@@ -6771,6 +6855,7 @@ mod owner_control_command_tests {
             abort_handle.id(),
             pool::TaskMeta {
                 agent_index,
+                claude: false,
                 channel_id: Some(scope.channel_id()),
                 scope: Some(scope),
                 turn_id: "t".to_string(),
@@ -7000,6 +7085,7 @@ mod owner_control_command_tests {
         let oldest = std::time::Instant::now() - Duration::from_secs(1);
         queue.push(queue::QueuedEvent {
             answer_required: None,
+            scheduled_workflow: false,
             edit: None,
             channel_id,
             scope: held_scope.clone(),
@@ -7010,6 +7096,7 @@ mod owner_control_command_tests {
         for i in 0..500 {
             queue.push(queue::QueuedEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 channel_id,
                 scope: surviving_scope.clone(),
@@ -10201,6 +10288,7 @@ mod build_mcp_servers_tests {
             config_path: std::path::PathBuf::from("./buzz-acp.toml"),
             context_message_limit: 12,
             max_turns_per_session: 0,
+            usage_guards: Default::default(),
             presence_enabled: true,
             typing_enabled: true,
             memory_enabled: false,
@@ -10704,6 +10792,7 @@ mod edit_native_steer_tests {
         let edit = edit_event(&original.id.to_hex(), &[]);
         let be = queue::BatchEvent {
             answer_required: None,
+            scheduled_workflow: false,
             event: edit.clone(),
             prompt_tag: "@mention".into(),
             received_at: std::time::Instant::now(),
@@ -10739,11 +10828,12 @@ mod edit_native_steer_tests {
             effective_author: "author".into(),
             prompt_tag: "@mention".into(),
             answer_required: true,
+            scheduled_workflow: false,
             edit: Some(resolved.clone()),
         };
         let scope = ingress.session_scope(scope::SessionPolicy::Channel, false);
         let mut queue = EventQueue::new(config::DedupMode::Queue);
-        let queued = ingress.push(&mut queue, scope, false);
+        let queued = ingress.push(&mut queue, scope, false, false);
         assert_eq!(queued.steer_event.edit, Some(resolved));
         assert_eq!(queued.reaction_target_id, original.id.to_hex());
     }
@@ -10787,13 +10877,14 @@ mod edit_native_steer_tests {
                 effective_author: "author".into(),
                 prompt_tag: "@mention".into(),
                 answer_required: true,
+                scheduled_workflow: false,
                 edit,
             };
 
         let mut queue = EventQueue::new(config::DedupMode::Queue);
         let running = ingress(running_event, None);
         let scope = running.session_scope(scope::SessionPolicy::Channel, is_dm);
-        running.push(&mut queue, scope.clone(), is_dm);
+        running.push(&mut queue, scope.clone(), is_dm, false);
         queue.flush_next().expect("running turn");
         assert!(queue.is_scope_in_flight(&scope));
         if let Some(prompt_is_dm) = prompt_is_dm {
@@ -10812,6 +10903,7 @@ mod edit_native_steer_tests {
             task.id(),
             pool::TaskMeta {
                 agent_index: 0,
+                claude: false,
                 channel_id: Some(channel_id),
                 scope: Some(scope.clone()),
                 turn_id: "t".into(),
@@ -10830,7 +10922,7 @@ mod edit_native_steer_tests {
         );
         let (ack_tx, _ack_rx) = mpsc::unbounded_channel();
         incoming_ingress
-            .push(&mut queue, scope.clone(), is_dm)
+            .push(&mut queue, scope.clone(), is_dm, false)
             .steer_or_interrupt(
                 MultipleEventHandling::Steer,
                 None,
@@ -10968,6 +11060,7 @@ mod edit_native_steer_tests {
             effective_author: "author".into(),
             prompt_tag: "@mention".into(),
             answer_required: true,
+            scheduled_workflow: false,
             edit: None,
         };
         let running = ingress(running_event);
@@ -11038,7 +11131,7 @@ mod edit_native_steer_tests {
         let ctx = Arc::new(ctx);
         let mut pool = AgentPool::from_slots(vec![Some(agent)]);
         let mut queue = EventQueue::new(config::DedupMode::Queue);
-        running.push(&mut queue, scope.clone(), is_dm);
+        running.push(&mut queue, scope.clone(), is_dm, false);
         let mut last_activity = tokio::time::Instant::now();
         let dispatched = dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity, None);
         assert_eq!(dispatched.len(), 1, "the running turn is dispatched");
@@ -11071,7 +11164,7 @@ mod edit_native_steer_tests {
 
         let (ack_tx, _ack_rx) = mpsc::unbounded_channel();
         ingress(incoming)
-            .push(&mut queue, scope.clone(), is_dm)
+            .push(&mut queue, scope.clone(), is_dm, false)
             .steer_or_interrupt(
                 MultipleEventHandling::Steer,
                 None,
@@ -11343,6 +11436,7 @@ mod error_outcome_emission_tests {
             config_path: std::path::PathBuf::from("./buzz-acp.toml"),
             context_message_limit: 12,
             max_turns_per_session: 0,
+            usage_guards: Default::default(),
             presence_enabled: true,
             typing_enabled: true,
             memory_enabled: false,
@@ -11430,6 +11524,7 @@ mod error_outcome_emission_tests {
             task_id,
             crate::pool::TaskMeta {
                 agent_index: 0,
+                claude: false,
                 channel_id: channel_turn.then_some(channel_id),
                 scope: channel_turn.then_some(scope.clone()),
                 turn_id: "idle-window".into(),
@@ -11548,6 +11643,7 @@ mod error_outcome_emission_tests {
             task_id,
             crate::pool::TaskMeta {
                 agent_index: 0,
+                claude: false,
                 channel_id: Some(channel_id),
                 scope: Some(scope::SessionScope::Conversation { channel_id }),
                 turn_id: "test-turn-id".into(),
@@ -11629,6 +11725,7 @@ mod error_outcome_emission_tests {
             task_id,
             crate::pool::TaskMeta {
                 agent_index: 0,
+                claude: false,
                 channel_id: Some(channel_id),
                 scope: Some(scope::SessionScope::Conversation { channel_id }),
                 turn_id: "test-turn-id".into(),
@@ -11752,6 +11849,7 @@ mod error_outcome_emission_tests {
             task_id,
             crate::pool::TaskMeta {
                 agent_index: 0,
+                claude: false,
                 channel_id: Some(channel_id),
                 scope: Some(scope::SessionScope::Conversation { channel_id }),
                 turn_id: "test-turn-id".into(),
@@ -11822,6 +11920,7 @@ mod error_outcome_emission_tests {
             task_id,
             crate::pool::TaskMeta {
                 agent_index: 0,
+                claude: false,
                 channel_id: None,
                 scope: None,
                 turn_id: "test-turn-id".to_string(),
@@ -11903,6 +12002,7 @@ mod error_outcome_emission_tests {
             task_id,
             crate::pool::TaskMeta {
                 agent_index: 0,
+                claude: false,
                 channel_id: Some(channel_id),
                 scope: Some(scope::SessionScope::Conversation { channel_id }),
                 turn_id: "panic-turn-id".to_string(),
@@ -11976,6 +12076,7 @@ mod error_outcome_emission_tests {
             .unwrap();
         queue.push(queue::QueuedEvent {
             answer_required: None,
+            scheduled_workflow: false,
             edit: None,
             channel_id,
             scope: scope.clone(),
@@ -11997,6 +12098,7 @@ mod error_outcome_emission_tests {
             abort_handle.id(),
             crate::pool::TaskMeta {
                 agent_index: 0,
+                claude: false,
                 channel_id: Some(channel_id),
                 scope: Some(scope.clone()),
                 turn_id: "panic-turn-id".to_string(),
@@ -12096,6 +12198,7 @@ mod error_outcome_emission_tests {
                 task_id,
                 crate::pool::TaskMeta {
                     agent_index: 0,
+                    claude: false,
                     channel_id: None,
                     scope: None,
                     turn_id: "test-turn-id".to_string(),
@@ -12176,6 +12279,7 @@ mod error_outcome_emission_tests {
                 scope: scope::SessionScope::Conversation { channel_id: __cid },
                 events: vec![BatchEvent {
                     answer_required: None,
+                    scheduled_workflow: false,
                     edit: None,
                     event,
                     prompt_tag: "test".into(),
@@ -12196,6 +12300,7 @@ mod error_outcome_emission_tests {
                 task_id,
                 crate::pool::TaskMeta {
                     agent_index: 0,
+                    claude: false,
                     channel_id: None,
                     scope: None,
                     turn_id: "test-turn-id".to_string(),
@@ -12288,6 +12393,7 @@ mod error_outcome_emission_tests {
                 scope: scope::SessionScope::Conversation { channel_id },
                 events: vec![BatchEvent {
                     answer_required: None,
+                    scheduled_workflow: false,
                     edit: None,
                     event,
                     prompt_tag: "test".into(),
@@ -12307,6 +12413,7 @@ mod error_outcome_emission_tests {
                 task_id,
                 crate::pool::TaskMeta {
                     agent_index: 0,
+                    claude: false,
                     channel_id: None,
                     scope: None,
                     turn_id: "test-turn-id".to_string(),
@@ -12386,6 +12493,7 @@ mod error_outcome_emission_tests {
             task_id,
             crate::pool::TaskMeta {
                 agent_index: 0,
+                claude: false,
                 channel_id: None,
                 scope: None,
                 turn_id: "test-turn-id".to_string(),
@@ -12412,6 +12520,7 @@ mod error_outcome_emission_tests {
             scope: scope::SessionScope::Conversation { channel_id },
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event: EventBuilder::new(Kind::Custom(9), "test")
                     .sign_with_keys(&Keys::generate())
@@ -12486,6 +12595,7 @@ mod error_outcome_emission_tests {
             task_id,
             crate::pool::TaskMeta {
                 agent_index: 0,
+                claude: false,
                 channel_id: None,
                 scope: None,
                 turn_id: "test-turn-id".to_string(),
@@ -12511,6 +12621,7 @@ mod error_outcome_emission_tests {
             scope: scope::SessionScope::Conversation { channel_id },
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event: EventBuilder::new(Kind::Custom(9), "final-attempt")
                     .sign_with_keys(&Keys::generate())
@@ -12595,6 +12706,7 @@ mod error_outcome_emission_tests {
             scope: scope::SessionScope::Conversation { channel_id },
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event: original_event.clone(),
                 prompt_tag: "test".into(),
@@ -12611,6 +12723,7 @@ mod error_outcome_emission_tests {
             task_id,
             crate::pool::TaskMeta {
                 agent_index: 0,
+                claude: false,
                 channel_id: None,
                 scope: None,
                 turn_id: "test-turn-id".to_string(),
@@ -12627,6 +12740,7 @@ mod error_outcome_emission_tests {
         // handle_prompt_result runs.
         queue.push(QueuedEvent {
             answer_required: None,
+            scheduled_workflow: false,
             edit: None,
             channel_id,
             scope: scope::SessionScope::Conversation { channel_id },
@@ -12756,6 +12870,7 @@ mod error_outcome_emission_tests {
             task_id,
             crate::pool::TaskMeta {
                 agent_index: 0,
+                claude: false,
                 channel_id: None,
                 scope: None,
                 turn_id: "test-turn-id".to_string(),
@@ -12872,6 +12987,7 @@ mod error_outcome_emission_tests {
             scope: session_scope.clone(),
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -12892,6 +13008,7 @@ mod error_outcome_emission_tests {
             task_id,
             crate::pool::TaskMeta {
                 agent_index: 0,
+                claude: false,
                 channel_id: Some(channel_id),
                 scope: Some(session_scope.clone()),
                 turn_id: "indeterminate-project".into(),
@@ -13024,6 +13141,7 @@ mod error_outcome_emission_tests {
             scope: scope::SessionScope::Conversation { channel_id },
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -13046,6 +13164,7 @@ mod error_outcome_emission_tests {
             task_id,
             crate::pool::TaskMeta {
                 agent_index: 0,
+                claude: false,
                 channel_id: None,
                 scope: None,
                 turn_id: "test-turn-id".to_string(),
@@ -13132,6 +13251,7 @@ mod error_outcome_emission_tests {
             scope: scope::SessionScope::Conversation { channel_id },
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit,
                 event,
                 prompt_tag: "test".into(),
@@ -13156,6 +13276,7 @@ mod error_outcome_emission_tests {
             task_id,
             crate::pool::TaskMeta {
                 agent_index: 0,
+                claude: false,
                 channel_id: None,
                 scope: None,
                 turn_id: "test-turn-id".to_string(),
@@ -13413,6 +13534,7 @@ mod error_outcome_emission_tests {
             scope: scope::SessionScope::Conversation { channel_id },
             events: vec![BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -13429,6 +13551,7 @@ mod error_outcome_emission_tests {
             task_id,
             crate::pool::TaskMeta {
                 agent_index: 0,
+                claude: false,
                 channel_id: None,
                 scope: None,
                 turn_id: "test-turn-id".to_string(),

@@ -43,6 +43,7 @@ use crate::queue::{
 };
 use crate::relay::{AuthoredPostQueryClient, ChannelInfo, RestClient, AUTHORED_POST_QUERY_TIMEOUT};
 use crate::scope::SessionScope;
+use crate::usage_guard::{LedgerRow, Reduction, UsageGuard};
 
 /// Window within which agent activity before a hard-cap death qualifies
 /// the turn as "recently active" (eligible for requeue instead of dead-letter).
@@ -76,6 +77,8 @@ pub struct SuccessfulSteerDelivery {
 
 pub struct TaskMeta {
     pub agent_index: usize,
+    /// Adapter type captured at dispatch for the admission gate on mid-turn input.
+    pub(crate) claude: bool,
     pub channel_id: Option<Uuid>,
     /// Session scope of the in-flight turn (mid-turn steer/signal routing and
     /// scope-to-worker affinity target this). `None` for heartbeat tasks.
@@ -143,6 +146,7 @@ pub struct SessionState {
     heartbeat_session: Option<String>,
     /// Deduplicated close requests for this adapter process.
     pending_close: HashSet<String>,
+    usage_sessions: HashMap<Option<SessionScope>, UsageSession>,
     /// Per-scope turn counters for proactive session rotation.
     /// Incremented on each successful prompt; reset when the session is rotated.
     pub turn_counts: HashMap<SessionScope, u32>,
@@ -170,6 +174,12 @@ pub struct SessionState {
     scope_owner_generations: HashMap<SessionScope, u64>,
 }
 
+#[derive(Default)]
+struct UsageSession {
+    turn_seq: u64,
+    compact_pending: bool,
+}
+
 impl SessionState {
     pub(crate) fn scope_session_id(&self, scope: &SessionScope) -> Option<&str> {
         self.sessions.get(scope).map(String::as_str)
@@ -177,6 +187,7 @@ impl SessionState {
 
     pub(crate) fn install_scope_session(&mut self, scope: SessionScope, session_id: String) {
         self.pending_close.remove(&session_id);
+        self.usage_sessions.remove(&Some(scope.clone()));
         if let Some(old_id) = self.sessions.insert(scope, session_id) {
             self.enqueue_close(old_id);
         }
@@ -184,6 +195,7 @@ impl SessionState {
 
     fn install_heartbeat_session(&mut self, session_id: String) {
         self.pending_close.remove(&session_id);
+        self.usage_sessions.remove(&None);
         if let Some(old_id) = self.heartbeat_session.replace(session_id) {
             self.enqueue_close(old_id);
         }
@@ -208,6 +220,7 @@ impl SessionState {
                 self.invalidate_scope(scope);
             }
             PromptSource::Heartbeat => {
+                self.usage_sessions.remove(&None);
                 if let Some(session_id) = self.heartbeat_session.take() {
                     self.enqueue_close(session_id);
                 }
@@ -220,6 +233,7 @@ impl SessionState {
     /// Invalidate a single session scope's session and turn counter.
     /// Returns `true` if the scope had an active session.
     pub fn invalidate_scope(&mut self, scope: &SessionScope) -> bool {
+        self.usage_sessions.remove(&Some(scope.clone()));
         self.turn_counts.remove(scope);
         self.core_sections.remove(scope);
         self.canvas_sections.remove(scope);
@@ -260,6 +274,7 @@ impl SessionState {
 
     /// Invalidate all sessions and turn counters (e.g. after agent exit).
     pub fn invalidate_all(&mut self) {
+        self.usage_sessions.clear();
         // All sessions are being retired, so none of these IDs can stay live.
         self.pending_close
             .extend(self.sessions.drain().map(|(_, id)| id));
@@ -292,6 +307,24 @@ impl SessionState {
             }
             delivery.hydrated_thread_roots.push_back(root);
         }
+    }
+
+    fn rotate_during_preparation(&mut self, source: &PromptSource) {
+        let generation = source
+            .scope()
+            .and_then(|scope| self.scope_owner_generations.get(scope))
+            .copied();
+        self.invalidate(source);
+        if let (Some(scope), Some(generation)) = (source.scope(), generation) {
+            self.set_scope_owner_generation(scope.clone(), generation);
+        }
+    }
+
+    fn schedule_compaction(&mut self, source: &PromptSource) {
+        self.usage_sessions
+            .entry(source.scope().cloned())
+            .or_default()
+            .compact_pending = true;
     }
 
     #[cfg(test)]
@@ -392,6 +425,98 @@ fn session_new_system_prompt<'a>(
 }
 
 impl OwnedAgent {
+    pub(crate) fn is_claude(&self) -> bool {
+        matches!(
+            self.agent_name.as_str(),
+            CLAUDE_AGENT_ACP_NAME | "claude-agent-acp" | "claude-code-acp"
+        )
+    }
+
+    pub(crate) fn admits_turn(&self, ctx: &PromptContext) -> bool {
+        ctx.usage_guard.admits(self.is_claude())
+    }
+
+    fn record_completed_prompt(
+        &mut self,
+        ctx: &PromptContext,
+        source: &PromptSource,
+        session_id: &str,
+        scheduled: bool,
+    ) -> CompletedPrompt {
+        let usage = self.acp.take_turn_usage();
+        let input = usage
+            .as_ref()
+            .and_then(|u| u.turn_input_tokens)
+            .unwrap_or(0);
+        let claude = self.is_claude();
+        let policy = ctx.usage_guard.settings.policy(claude);
+        let claude_max_turns = ctx.usage_guard.settings.max_turns(claude, 0);
+        let mut reduction = policy.reduction(claude, scheduled, input);
+        ctx.usage_guard.record_window(claude, input);
+        let ledger_enabled = ctx.usage_guard.settings.ledger_dir.is_some();
+        if ledger_enabled || claude_max_turns != 0 {
+            let state = self
+                .state
+                .usage_sessions
+                .entry(source.scope().cloned())
+                .or_default();
+            state.turn_seq = state.turn_seq.saturating_add(1);
+            if claude_max_turns != 0 && state.turn_seq >= u64::from(claude_max_turns) {
+                reduction = Reduction::Rotate;
+            }
+            if ledger_enabled {
+                let pubkey = ctx.agent_keys.public_key().to_hex();
+                let row = LedgerRow::new(
+                    (&self.agent_name, &ctx.harness_name, &pubkey),
+                    policy.admission_file.as_deref(),
+                    session_id,
+                    state.turn_seq,
+                    usage.as_ref(),
+                );
+                ctx.usage_guard.append(&row);
+            }
+        }
+        CompletedPrompt { usage, reduction }
+    }
+
+    pub(crate) fn compaction_budget(
+        &self,
+        scope: &SessionScope,
+        max_duration: Duration,
+    ) -> Duration {
+        if self
+            .state
+            .usage_sessions
+            .get(&Some(scope.clone()))
+            .is_some_and(|state| state.compact_pending)
+        {
+            max_duration.saturating_add(SESSION_CLOSE_TIMEOUT)
+        } else {
+            Duration::ZERO
+        }
+    }
+
+    /// Reserve time for guarded setup prompts that can compact or rotate.
+    pub(crate) fn initial_reduction_budget(
+        &self,
+        ctx: &PromptContext,
+        scope: &SessionScope,
+    ) -> Duration {
+        let policy = ctx.usage_guard.settings.policy(self.is_claude());
+        if ctx.initial_message.is_some()
+            && !self.state.sessions.contains_key(scope)
+            && (policy.compact != 0
+                || policy.rotate != 0
+                || ctx.usage_guard.settings.max_turns(self.is_claude(), 0) != 0)
+        {
+            ctx.prompt_duration(self)
+                .saturating_mul(2)
+                .saturating_add(SESSION_CLOSE_TIMEOUT)
+        } else {
+            Duration::ZERO
+        }
+    }
+
     /// Budget the pre-turn drain when setting the queue's in-flight deadline.
     pub(crate) fn abandoned_session_close_budget(&self) -> Duration {
         if self.acp.session_close_supported() {
@@ -773,6 +898,8 @@ pub enum PromptOutcome {
     /// Local relay state could not establish project authority. The ACP
     /// process is healthy; preserve the batch for bounded retry.
     ProjectContextIndeterminate(String),
+    /// The admission file closed before the queued batch reached the adapter.
+    AdmissionBlocked,
     AgentExited,
     Timeout(TimeoutKind),
     /// Intentional cancel via `!cancel` command or interrupt mode.
@@ -978,6 +1105,7 @@ pub struct PromptContext {
     pub context_message_limit: u32,
     /// Max turns per session before proactive rotation. 0 = disabled.
     pub max_turns_per_session: u32,
+    pub(crate) usage_guard: UsageGuard,
     /// Permission mode to apply after session creation. `Default` = skip.
     pub permission_mode: PermissionMode,
     /// Agent identity — used to derive the NIP-AE conversation key at
@@ -1002,15 +1130,30 @@ pub struct PromptContext {
 }
 
 impl PromptContext {
+    pub(crate) fn prompt_duration(&self, agent: &OwnedAgent) -> Duration {
+        self.usage_guard
+            .settings
+            .max_duration(agent.is_claude(), self.max_turn_duration)
+    }
+
     /// Two prompt budgets and up to two relay checks while the scope is busy.
-    pub(crate) fn silent_turn_budget(&self, batch: &FlushBatch) -> Option<Duration> {
+    pub(crate) fn silent_turn_budget(
+        &self,
+        batch: &FlushBatch,
+        max_duration: Duration,
+    ) -> Option<Duration> {
         (self.authored_post_query.is_some() && batch.needs_answer()).then(|| {
-            self.max_turn_duration
+            max_duration
                 .saturating_add(self.silent_turn_grace)
                 .saturating_add(AUTHORED_POST_QUERY_TIMEOUT)
                 .saturating_mul(2)
         })
     }
+}
+
+struct CompletedPrompt {
+    usage: Option<crate::usage::TurnUsage>,
+    reduction: Reduction,
 }
 
 impl AgentPool {
@@ -1132,12 +1275,16 @@ impl AgentPool {
     /// Pass 2: any idle agent.
     ///
     /// Returns `None` if all agents are checked out.
-    pub fn try_claim(&mut self, scope: Option<&SessionScope>) -> Option<OwnedAgent> {
+    pub fn try_claim(
+        &mut self,
+        scope: Option<&SessionScope>,
+        admits: impl Fn(&OwnedAgent) -> bool,
+    ) -> Option<OwnedAgent> {
         // Pass 1: prefer agent with existing session for this scope.
         if let Some(scope) = scope {
             let idx = self.agents.iter().position(|slot| {
                 slot.as_ref()
-                    .map(|a| self.agent_owns_scope(a, scope))
+                    .map(|a| self.agent_owns_scope(a, scope) && admits(a))
                     .unwrap_or(false)
             });
             if let Some(i) = idx {
@@ -1146,8 +1293,11 @@ impl AgentPool {
         }
 
         // Pass 2: first idle agent.
-        let idx = self.agents.iter().position(|slot| slot.is_some());
-        idx.map(|i| self.agents[i].take().unwrap())
+        let slot = self
+            .agents
+            .iter_mut()
+            .find(|slot| slot.as_ref().is_some_and(&admits))?;
+        slot.take()
     }
 
     /// Return an agent to its slot after a task completes.
@@ -1189,6 +1339,24 @@ impl AgentPool {
     /// Whether any agent is currently idle (sitting in its slot).
     pub fn any_idle(&self) -> bool {
         self.agents.iter().any(|slot| slot.is_some())
+    }
+
+    pub(crate) fn any_admitted(&self, ctx: &PromptContext) -> bool {
+        self.agents
+            .iter()
+            .flatten()
+            .any(|agent| agent.admits_turn(ctx))
+    }
+
+    pub(crate) fn scope_admission_blocked(
+        &self,
+        ctx: &PromptContext,
+        scope: &SessionScope,
+    ) -> bool {
+        ctx.usage_guard.settings.has_admission_file()
+            && self.task_map.values().any(|task| {
+                task.scope.as_ref() == Some(scope) && !ctx.usage_guard.admits(task.claude)
+            })
     }
 
     /// Confirm that pending work for `scope` successfully claimed a worker.
@@ -1697,9 +1865,14 @@ async fn create_session_and_apply_model(
         ctx.session_title.as_deref(),
     );
 
+    let max_inner_turns = if agent.is_claude() {
+        ctx.usage_guard.settings.claude_max_inner_turns
+    } else {
+        0
+    };
     let resp = agent
         .acp
-        .session_new_full(
+        .session_new_with_max_turns(
             &ctx.cwd,
             mcp_servers,
             session_new_system_prompt(
@@ -1709,6 +1882,7 @@ async fn create_session_and_apply_model(
                 combined_system_prompt.as_deref(),
             ),
             session_title.as_deref(),
+            max_inner_turns,
         )
         .await?;
 
@@ -1951,6 +2125,9 @@ pub(crate) async fn run_isolated_prompt(
     max_duration: Duration,
     active_session: &mut Option<String>,
 ) -> Result<StopReason, AcpError> {
+    if !agent.admits_turn(ctx) {
+        return Err(AcpError::AdmissionClosed);
+    }
     let core = if ctx.memory_enabled {
         if let Some(owner) = &ctx.agent_owner_pubkey {
             tokio::time::timeout(
@@ -1997,10 +2174,18 @@ pub(crate) async fn run_isolated_prompt(
         },
         prompt,
     );
-    agent
+    if !agent.admits_turn(ctx) {
+        return Err(AcpError::AdmissionClosed);
+    }
+    let duration = max_duration.min(ctx.prompt_duration(agent));
+    let result = agent
         .acp
-        .session_prompt_with_idle_timeout(&session_id, &prompt, ctx.idle_timeout, max_duration)
-        .await
+        .session_prompt_with_idle_timeout(&session_id, &prompt, ctx.idle_timeout, duration)
+        .await;
+    if result.is_ok() {
+        agent.record_completed_prompt(ctx, &PromptSource::Heartbeat, &session_id, false);
+    }
+    result
 }
 
 fn mcp_servers_with_git_origin(
@@ -2520,8 +2705,72 @@ async fn close_abandoned_sessions(agent: &mut OwnedAgent) {
     }
 }
 
+async fn compact_before_prompt(
+    agent: &mut OwnedAgent,
+    ctx: &PromptContext,
+    source: &PromptSource,
+    turn_id: &str,
+) -> Result<(), AcpError> {
+    let Some(state) = agent.state.usage_sessions.get_mut(&source.scope().cloned()) else {
+        return Ok(());
+    };
+    if !state.compact_pending {
+        return Ok(());
+    }
+    state.compact_pending = false;
+    let session_id = match source {
+        PromptSource::Channel(scope) => agent.state.sessions.get(scope),
+        PromptSource::Heartbeat => agent.state.heartbeat_session.as_ref(),
+    };
+    let Some(session_id) = session_id.cloned() else {
+        return Ok(());
+    };
+    let duration = ctx.prompt_duration(agent);
+    let steer_rx = agent.acp.take_steer_rx();
+    let result = agent
+        .acp
+        .session_prompt_with_idle_timeout(&session_id, "/compact", ctx.idle_timeout, duration)
+        .await;
+    if let Some(steer_rx) = steer_rx {
+        agent.acp.install_steer_rx(steer_rx);
+    }
+    if let Ok(stop) = &result {
+        let completed = agent.record_completed_prompt(ctx, source, &session_id, false);
+        publish_agent_turn_metric(
+            ctx,
+            completed.usage,
+            source.channel_id(),
+            &session_id,
+            &format!("{turn_id}:compact"),
+            Some(acp_stop_to_core(stop)),
+        )
+        .await;
+        if matches!(stop, StopReason::EndTurn) {
+            if completed.reduction == Reduction::Rotate {
+                agent.state.rotate_during_preparation(source);
+                close_abandoned_sessions(agent).await;
+            }
+            return Ok(());
+        }
+    }
+    tracing::warn!(
+        session_id,
+        ?result,
+        "Claude compaction failed; rotating and retrying the queued turn"
+    );
+    if let Err(error) = result {
+        if !matches!(error, AcpError::AgentError { .. }) {
+            return Err(error);
+        }
+    }
+    agent.state.rotate_during_preparation(source);
+    close_abandoned_sessions(agent).await;
+    Ok(())
+}
+
 /// Apply the bounded silent-turn policy to a normal ACP completion. A relay
 /// error leaves the post status unknown and preserves the original result.
+#[allow(clippy::too_many_arguments)]
 async fn enforce_silent_turn_continuation(
     agent: &mut OwnedAgent,
     session_id: &str,
@@ -2530,6 +2779,7 @@ async fn enforce_silent_turn_continuation(
     turn_watermark: u64,
     turn_id: &str,
     stop_reason: StopReason,
+    completed: &mut Option<CompletedPrompt>,
 ) -> Result<StopReason, AcpError> {
     let (Some(batch), Some(query)) = (batch, &ctx.authored_post_query) else {
         return Ok(stop_reason);
@@ -2553,12 +2803,12 @@ async fn enforce_silent_turn_continuation(
         }
     }
 
-    if !batch.claim_continuation() {
+    if !agent.admits_turn(ctx) || !batch.claim_continuation() {
         return Ok(stop_reason);
     }
     // Starting another ACP prompt resets its usage tracker. Record the
     // original prompt's usage before sending the continuation.
-    let usage = agent.acp.take_turn_usage();
+    let usage = completed.take().and_then(|completed| completed.usage);
     publish_agent_turn_metric(
         ctx,
         usage,
@@ -2572,15 +2822,22 @@ async fn enforce_silent_turn_continuation(
         target: "pool::prompt", %channel_id, scope = %scope.telemetry_label(),
         "mention-triggered turn ended silently — issuing one continuation"
     );
+    let duration = ctx.prompt_duration(agent);
     let continuation = agent
         .acp
         .session_prompt_blocks_with_idle_timeout(
             session_id,
             &[SILENT_TURN_CONTINUATION_PROMPT],
             ctx.idle_timeout,
-            ctx.max_turn_duration,
+            duration,
         )
         .await?;
+    *completed = Some(agent.record_completed_prompt(
+        ctx,
+        &PromptSource::Channel(scope.clone()),
+        session_id,
+        false,
+    ));
 
     if matches!(continuation, StopReason::EndTurn) {
         tokio::time::sleep(ctx.silent_turn_grace).await;
@@ -2641,6 +2898,7 @@ pub async fn run_prompt_task(
         None => PromptSource::Heartbeat,
     };
     let observer_channel_id = source.channel_id();
+    let max_duration = ctx.prompt_duration(&agent);
     // Thread conversation context requires the canonical root to distinguish
     // concurrent threads in the same channel's activity.
     let observer_thread_root = source.scope().and_then(SessionScope::root_event_id);
@@ -2709,7 +2967,33 @@ pub async fn run_prompt_task(
     let liveness_handle = tokio::spawn(liveness);
     let liveness_guard = LivenessGuard::new(liveness_handle, liveness_state);
 
+    if !agent.admits_turn(&ctx) {
+        send_prompt_result(
+            &result_tx,
+            &turn_id,
+            agent,
+            source,
+            PromptOutcome::AdmissionBlocked,
+            batch,
+        );
+        return;
+    }
     close_abandoned_sessions(&mut agent).await;
+    if agent.admits_turn(&ctx) {
+        if let Err(error) = compact_before_prompt(&mut agent, &ctx, &source, &turn_id).await {
+            tracing::warn!(%error, "retiring worker after failed Claude compaction");
+            agent.state.invalidate_all();
+            send_prompt_result(
+                &result_tx,
+                &turn_id,
+                agent,
+                source,
+                PromptOutcome::AgentExited,
+                batch,
+            );
+            return;
+        }
+    }
 
     // Collects event IDs up front. On drop (any exit path — normal, early
     // return, or panic), spawns best-effort cleanup of both 👀 and 💬.
@@ -2892,267 +3176,52 @@ pub async fn run_prompt_task(
         PromptSource::Heartbeat => None,
     };
 
-    let (session_id, is_new_session) = match &source {
-        PromptSource::Channel(scope) => {
-            let cid = &scope.channel_id();
-            if let Some(sid) = agent.state.sessions.get(scope) {
-                (sid.clone(), false)
-            } else {
-                // The title includes channel and, for thread sessions, the
-                // canonical root prefix so sibling sessions are distinguishable.
-                // DMs, unresolved, and unnamed channels omit the channel name.
-                match create_session_and_apply_model(
-                    &mut agent,
-                    &ctx,
-                    agent_core.as_deref(),
-                    NewSessionChannelContext {
-                        huddle_instructions: huddle_instructions.as_deref(),
-                        canvas: agent_canvas.as_deref(),
-                        name: title_channel.as_deref(),
-                        scope: Some(scope),
-                        channel_type: origin_channel_type.as_deref(),
-                    },
-                )
-                .await
-                {
-                    Ok(sid) => {
-                        tracing::info!(
-                            target: "pool::session",
-                            "created session {sid} for channel {cid} (scope {})",
-                            scope.telemetry_label()
-                        );
-                        agent
-                            .state
-                            .install_scope_session(scope.clone(), sid.clone());
-                        agent
-                            .state
-                            .deliveries
-                            .insert(scope.clone(), ChannelDeliveryState::default());
-                        // Seed a zero usage baseline: buzz-acp spawned this session
-                        // so prior usage is zero by definition — first turn is reliable.
-                        agent.acp.notify_session_spawned(&sid);
-                        // Commit canvas only after session creation succeeds (I3).
-                        if let Some((pending_scope, section)) = pending_canvas.take() {
-                            agent.state.canvas_sections.insert(pending_scope, section);
-                        }
-                        (sid, true)
-                    }
-                    Err(AcpError::AgentExited) => {
-                        agent.state.invalidate_all();
-                        send_prompt_result(
-                            &result_tx,
-                            &turn_id,
-                            agent,
-                            source,
-                            PromptOutcome::AgentExited,
-                            requeue_batch_if_queue(&ctx, batch),
-                        );
-                        return;
-                    }
-                    Err(e) => {
-                        // Session creation failed; pending canvas was never committed,
-                        // so the next retry will re-fetch a fresh revision.
-                        send_prompt_result(
-                            &result_tx,
-                            &turn_id,
-                            agent,
-                            source,
-                            PromptOutcome::Error(e),
-                            requeue_batch_if_queue(&ctx, batch),
-                        );
-                        return;
-                    }
-                }
-            }
-        }
-        PromptSource::Heartbeat => {
-            if let Some(sid) = &agent.state.heartbeat_session {
-                (sid.clone(), false)
-            } else {
-                match create_session_and_apply_model(
-                    &mut agent,
-                    &ctx,
-                    None,
-                    NewSessionChannelContext {
-                        huddle_instructions: None,
-                        canvas: None,
-                        name: None,
-                        scope: None,
-                        channel_type: None,
-                    },
-                )
-                .await
-                {
-                    Ok(sid) => {
-                        tracing::info!(
-                            target: "pool::session",
-                            "created heartbeat session {sid} for agent {}",
-                            agent.index
-                        );
-                        agent.state.install_heartbeat_session(sid.clone());
-                        // Seed a zero usage baseline: buzz-acp spawned this session.
-                        agent.acp.notify_session_spawned(&sid);
-                        (sid, true)
-                    }
-                    Err(AcpError::AgentExited) => {
-                        agent.state.invalidate_all();
-                        send_prompt_result(
-                            &result_tx,
-                            &turn_id,
-                            agent,
-                            source,
-                            PromptOutcome::AgentExited,
-                            None,
-                        );
-                        return;
-                    }
-                    Err(e) => {
-                        send_prompt_result(
-                            &result_tx,
-                            &turn_id,
-                            agent,
-                            source,
-                            PromptOutcome::Error(e),
-                            None,
-                        );
-                        return;
-                    }
-                }
-            }
-        }
-    };
-    agent.acp.set_observer_context(observer::context_for_turn(
-        observer_channel_id,
-        Some(session_id.clone()),
-        turn_id.clone(),
-        turn_started_at,
-    ));
-    // Backfill liveness's shared session ID so ticks after this point carry
-    // it too, matching every other observer frame for this turn.
-    liveness_guard.set_session_id(session_id.clone());
-    agent.acp.observe(
-        "session_resolved",
-        serde_json::json!({
-            "sessionId": session_id,
-            "isNewSession": is_new_session,
-        }),
-    );
-
-    // Standing context is fixed for the life of a session. Agents with
-    // systemPrompt support already hold it from session/new; legacy agents
-    // receive it in the session's first user message and never again.
-    //
-    // `is_new_session` comes from the session registry, which is cleared
-    // whenever a session is invalidated — so the replacement session re-delivers
-    // rather than leaving the agent unbriefed.
-    let standing = crate::queue::StandingContext {
-        base_prompt: ctx.base_prompt.as_deref(),
-        system_prompt: ctx.system_prompt.as_deref(),
-        team_instructions: ctx.team_instructions.as_deref(),
-        agent_core: agent_core.as_deref(),
-        huddle_instructions: huddle_instructions.as_deref(),
-        agent_canvas: agent_canvas.as_deref(),
-    };
-    // Delivery state is committed only after ACP confirms success. Existing
-    // sessions created before this field existed fail safe by behaving as
-    // undelivered once, rather than silently omitting standing context.
-    let mut standing_context_sent = match &source {
-        PromptSource::Channel(scope) => agent
-            .state
-            .deliveries
-            .get(scope)
-            .is_some_and(|delivery| delivery.standing_context_sent),
-        PromptSource::Heartbeat => agent.state.heartbeat_standing_context_sent,
-    };
-
-    if is_new_session {
-        if let (PromptSource::Channel(scope), Some(ref initial_msg)) =
-            (&source, &ctx.initial_message)
-        {
-            let cid = &scope.channel_id();
-            tracing::info!(
-                target: "pool::session",
-                "sending initial_message to session {session_id} for channel {cid}"
-            );
-            let init_msg = prepend_standing_for_legacy(
-                if agent.has_system_prompt_support() {
-                    2
+    let mut send_initial_message = true;
+    let (session_id, standing, standing_context_sent) = loop {
+        let (session_id, is_new_session) = match &source {
+            PromptSource::Channel(scope) => {
+                let cid = &scope.channel_id();
+                if let Some(sid) = agent.state.sessions.get(scope) {
+                    (sid.clone(), false)
                 } else {
-                    1
-                },
-                &standing,
-                initial_msg,
-            );
-            let init_result = agent
-                .acp
-                .session_prompt_with_idle_timeout(
-                    &session_id,
-                    &init_msg,
-                    ctx.idle_timeout,
-                    ctx.max_turn_duration,
-                )
-                .await;
-
-            match init_result {
-                Ok(stop_reason) => {
-                    tracing::info!(
-                        target: "pool::session",
-                        "initial_message complete for channel {cid}: {stop_reason:?}"
-                    );
-                    // The legacy agent has its standing context now; the turn
-                    // prompt below must not repeat it. Every other arm returns.
-                    standing_context_sent = true;
-                    if !agent.has_system_prompt_support() {
-                        agent
-                            .state
-                            .mark_scope_delivery_success(scope.clone(), true, [], []);
-                    }
-                    let usage = agent.acp.take_turn_usage();
-                    publish_agent_turn_metric(
+                    // The title includes channel and, for thread sessions, the
+                    // canonical root prefix so sibling sessions are distinguishable.
+                    // DMs, unresolved, and unnamed channels omit the channel name.
+                    match create_session_and_apply_model(
+                        &mut agent,
                         &ctx,
-                        usage,
-                        Some(*cid),
-                        &session_id,
-                        &format!("{turn_id}:initial"),
-                        Some(acp_stop_to_core(&stop_reason)),
+                        agent_core.as_deref(),
+                        NewSessionChannelContext {
+                            huddle_instructions: huddle_instructions.as_deref(),
+                            canvas: agent_canvas.as_deref(),
+                            name: title_channel.as_deref(),
+                            scope: Some(scope),
+                            channel_type: origin_channel_type.as_deref(),
+                        },
                     )
-                    .await;
-                }
-                Err(AcpError::AgentExited) => {
-                    agent.state.invalidate_all();
-                    send_prompt_result(
-                        &result_tx,
-                        &turn_id,
-                        agent,
-                        source,
-                        PromptOutcome::AgentExited,
-                        requeue_batch_if_queue(&ctx, batch),
-                    );
-                    return;
-                }
-                Err(AcpError::IdleTimeout(_)) => {
-                    tracing::warn!(
-                        target: "pool::session",
-                        "initial_message idle timeout ({}s) for channel {cid} — cancelling",
-                        ctx.idle_timeout.as_secs()
-                    );
-                    match agent
-                        .acp
-                        .cancel_with_cleanup(&session_id, ctx.idle_timeout)
-                        .await
+                    .await
                     {
-                        Ok(stop_reason) => {
-                            let usage = agent.acp.take_turn_usage();
-                            publish_agent_turn_metric(
-                                &ctx,
-                                usage,
-                                Some(*cid),
-                                &session_id,
-                                &format!("{turn_id}:initial"),
-                                Some(acp_stop_to_core(&stop_reason)),
-                            )
-                            .await;
-                            agent.state.invalidate(&source);
+                        Ok(sid) => {
+                            tracing::info!(
+                                target: "pool::session",
+                                "created session {sid} for channel {cid} (scope {})",
+                                scope.telemetry_label()
+                            );
+                            agent
+                                .state
+                                .install_scope_session(scope.clone(), sid.clone());
+                            agent
+                                .state
+                                .deliveries
+                                .insert(scope.clone(), ChannelDeliveryState::default());
+                            // Seed a zero usage baseline: buzz-acp spawned this session
+                            // so prior usage is zero by definition — first turn is reliable.
+                            agent.acp.notify_session_spawned(&sid);
+                            // Commit canvas only after session creation succeeds (I3).
+                            if let Some((pending_scope, section)) = pending_canvas.take() {
+                                agent.state.canvas_sections.insert(pending_scope, section);
+                            }
+                            (sid, true)
                         }
                         Err(AcpError::AgentExited) => {
                             agent.state.invalidate_all();
@@ -3167,60 +3236,330 @@ pub async fn run_prompt_task(
                             return;
                         }
                         Err(e) => {
-                            tracing::error!(
-                                target: "pool::session",
-                                "cancel_with_cleanup failed during initial_message timeout: {e}"
+                            // Session creation failed; pending canvas was never committed,
+                            // so the next retry will re-fetch a fresh revision.
+                            send_prompt_result(
+                                &result_tx,
+                                &turn_id,
+                                agent,
+                                source,
+                                PromptOutcome::Error(e),
+                                requeue_batch_if_queue(&ctx, batch),
                             );
-                            agent.state.invalidate(&source);
+                            return;
                         }
                     }
-                    send_prompt_result(
-                        &result_tx,
-                        &turn_id,
-                        agent,
-                        source,
-                        PromptOutcome::Timeout(TimeoutKind::Idle),
-                        requeue_batch_if_queue(&ctx, batch),
-                    );
-                    return;
                 }
-                Err(AcpError::HardTimeout { silence }) => {
-                    let recently_active = silence < RECENT_ACTIVITY_WINDOW;
-                    tracing::error!(
-                        target: "pool::session",
-                        "hard timeout ({}s cap, silence {silence:?}, recently_active={recently_active}) during initial_message for channel {cid} — agent process is unrecoverable",
-                        ctx.max_turn_duration.as_secs()
-                    );
-                    agent.state.invalidate_all();
-                    send_prompt_result(
-                        &result_tx,
-                        &turn_id,
-                        agent,
-                        source,
-                        PromptOutcome::Timeout(TimeoutKind::Hard { recently_active }),
-                        requeue_batch_if_queue(&ctx, batch),
-                    );
-                    return;
+            }
+            PromptSource::Heartbeat => {
+                if let Some(sid) = &agent.state.heartbeat_session {
+                    (sid.clone(), false)
+                } else {
+                    match create_session_and_apply_model(
+                        &mut agent,
+                        &ctx,
+                        None,
+                        NewSessionChannelContext {
+                            huddle_instructions: None,
+                            canvas: None,
+                            name: None,
+                            scope: None,
+                            channel_type: None,
+                        },
+                    )
+                    .await
+                    {
+                        Ok(sid) => {
+                            tracing::info!(
+                                target: "pool::session",
+                                "created heartbeat session {sid} for agent {}",
+                                agent.index
+                            );
+                            agent.state.install_heartbeat_session(sid.clone());
+                            // Seed a zero usage baseline: buzz-acp spawned this session.
+                            agent.acp.notify_session_spawned(&sid);
+                            (sid, true)
+                        }
+                        Err(AcpError::AgentExited) => {
+                            agent.state.invalidate_all();
+                            send_prompt_result(
+                                &result_tx,
+                                &turn_id,
+                                agent,
+                                source,
+                                PromptOutcome::AgentExited,
+                                None,
+                            );
+                            return;
+                        }
+                        Err(e) => {
+                            send_prompt_result(
+                                &result_tx,
+                                &turn_id,
+                                agent,
+                                source,
+                                PromptOutcome::Error(e),
+                                None,
+                            );
+                            return;
+                        }
+                    }
                 }
-                Err(e) => {
-                    tracing::error!(
-                        target: "pool::session",
-                        "initial_message failed for channel {cid}: {e} — invalidating session"
-                    );
+            }
+        };
+        agent.acp.set_observer_context(observer::context_for_turn(
+            observer_channel_id,
+            Some(session_id.clone()),
+            turn_id.clone(),
+            turn_started_at.clone(),
+        ));
+        // Backfill liveness's shared session ID so ticks after this point carry
+        // it too, matching every other observer frame for this turn.
+        liveness_guard.set_session_id(session_id.clone());
+        agent.acp.observe(
+            "session_resolved",
+            serde_json::json!({
+                "sessionId": session_id,
+                "isNewSession": is_new_session,
+            }),
+        );
+
+        // Standing context is fixed for the life of a session. Agents with
+        // systemPrompt support already hold it from session/new; legacy agents
+        // receive it in the session's first user message and never again.
+        //
+        // `is_new_session` comes from the session registry, which is cleared
+        // whenever a session is invalidated — so the replacement session re-delivers
+        // rather than leaving the agent unbriefed.
+        let standing = crate::queue::StandingContext {
+            base_prompt: ctx.base_prompt.as_deref(),
+            system_prompt: ctx.system_prompt.as_deref(),
+            team_instructions: ctx.team_instructions.as_deref(),
+            agent_core: agent_core.as_deref(),
+            huddle_instructions: huddle_instructions.as_deref(),
+            agent_canvas: agent_canvas.as_deref(),
+        };
+        // Delivery state is committed only after ACP confirms success. Existing
+        // sessions created before this field existed fail safe by behaving as
+        // undelivered once, rather than silently omitting standing context.
+        let mut standing_context_sent = match &source {
+            PromptSource::Channel(scope) => agent
+                .state
+                .deliveries
+                .get(scope)
+                .is_some_and(|delivery| delivery.standing_context_sent),
+            PromptSource::Heartbeat => agent.state.heartbeat_standing_context_sent,
+        };
+
+        if is_new_session && send_initial_message {
+            if let (PromptSource::Channel(scope), Some(ref initial_msg)) =
+                (&source, &ctx.initial_message)
+            {
+                if !agent.admits_turn(&ctx) {
                     agent.state.invalidate(&source);
                     send_prompt_result(
                         &result_tx,
                         &turn_id,
                         agent,
                         source,
-                        PromptOutcome::Error(e),
-                        requeue_batch_if_queue(&ctx, batch),
+                        PromptOutcome::AdmissionBlocked,
+                        batch,
                     );
                     return;
                 }
+                let cid = &scope.channel_id();
+                tracing::info!(
+                    target: "pool::session",
+                    "sending initial_message to session {session_id} for channel {cid}"
+                );
+                let init_msg = prepend_standing_for_legacy(
+                    if agent.has_system_prompt_support() {
+                        2
+                    } else {
+                        1
+                    },
+                    &standing,
+                    initial_msg,
+                );
+                let init_result = agent
+                    .acp
+                    .session_prompt_with_idle_timeout(
+                        &session_id,
+                        &init_msg,
+                        ctx.idle_timeout,
+                        max_duration,
+                    )
+                    .await;
+
+                match init_result {
+                    Ok(stop_reason) => {
+                        tracing::info!(
+                            target: "pool::session",
+                            "initial_message complete for channel {cid}: {stop_reason:?}"
+                        );
+                        // The legacy agent has its standing context now; the turn
+                        // prompt below must not repeat it. Every other arm returns.
+                        standing_context_sent = true;
+                        if !agent.has_system_prompt_support() {
+                            agent
+                                .state
+                                .mark_scope_delivery_success(scope.clone(), true, [], []);
+                        }
+                        let completed =
+                            agent.record_completed_prompt(&ctx, &source, &session_id, false);
+                        publish_agent_turn_metric(
+                            &ctx,
+                            completed.usage,
+                            Some(*cid),
+                            &session_id,
+                            &format!("{turn_id}:initial"),
+                            Some(acp_stop_to_core(&stop_reason)),
+                        )
+                        .await;
+                        match completed.reduction {
+                            Reduction::Rotate => {
+                                agent.state.rotate_during_preparation(&source);
+                                close_abandoned_sessions(&mut agent).await;
+                            }
+                            Reduction::Compact => {
+                                agent.state.schedule_compaction(&source);
+                                if agent.admits_turn(&ctx) {
+                                    if let Err(error) =
+                                        compact_before_prompt(&mut agent, &ctx, &source, &turn_id)
+                                            .await
+                                    {
+                                        tracing::warn!(%error, "retiring worker after failed Claude compaction");
+                                        agent.state.invalidate_all();
+                                        send_prompt_result(
+                                            &result_tx,
+                                            &turn_id,
+                                            agent,
+                                            source,
+                                            PromptOutcome::AgentExited,
+                                            batch,
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
+                            Reduction::None => {}
+                        }
+                        if !agent.state.sessions.contains_key(scope) {
+                            // The setup prompt was already delivered. The next
+                            // session starts with fresh context and the queued turn.
+                            pending_canvas =
+                                agent_canvas.clone().map(|section| (scope.clone(), section));
+                            send_initial_message = false;
+                            continue;
+                        }
+                    }
+                    Err(AcpError::AgentExited) => {
+                        agent.state.invalidate_all();
+                        send_prompt_result(
+                            &result_tx,
+                            &turn_id,
+                            agent,
+                            source,
+                            PromptOutcome::AgentExited,
+                            requeue_batch_if_queue(&ctx, batch),
+                        );
+                        return;
+                    }
+                    Err(AcpError::IdleTimeout(_)) => {
+                        tracing::warn!(
+                            target: "pool::session",
+                            "initial_message idle timeout ({}s) for channel {cid} — cancelling",
+                            ctx.idle_timeout.as_secs()
+                        );
+                        match agent
+                            .acp
+                            .cancel_with_cleanup(&session_id, ctx.idle_timeout)
+                            .await
+                        {
+                            Ok(stop_reason) => {
+                                let usage = agent
+                                    .record_completed_prompt(&ctx, &source, &session_id, false)
+                                    .usage;
+                                publish_agent_turn_metric(
+                                    &ctx,
+                                    usage,
+                                    Some(*cid),
+                                    &session_id,
+                                    &format!("{turn_id}:initial"),
+                                    Some(acp_stop_to_core(&stop_reason)),
+                                )
+                                .await;
+                                agent.state.invalidate(&source);
+                            }
+                            Err(AcpError::AgentExited) => {
+                                agent.state.invalidate_all();
+                                send_prompt_result(
+                                    &result_tx,
+                                    &turn_id,
+                                    agent,
+                                    source,
+                                    PromptOutcome::AgentExited,
+                                    requeue_batch_if_queue(&ctx, batch),
+                                );
+                                return;
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    target: "pool::session",
+                                    "cancel_with_cleanup failed during initial_message timeout: {e}"
+                                );
+                                agent.state.invalidate(&source);
+                            }
+                        }
+                        send_prompt_result(
+                            &result_tx,
+                            &turn_id,
+                            agent,
+                            source,
+                            PromptOutcome::Timeout(TimeoutKind::Idle),
+                            requeue_batch_if_queue(&ctx, batch),
+                        );
+                        return;
+                    }
+                    Err(AcpError::HardTimeout { silence }) => {
+                        let recently_active = silence < RECENT_ACTIVITY_WINDOW;
+                        tracing::error!(
+                            target: "pool::session",
+                            "hard timeout ({}s cap, silence {silence:?}, recently_active={recently_active}) during initial_message for channel {cid} — agent process is unrecoverable",
+                            max_duration.as_secs()
+                        );
+                        agent.state.invalidate_all();
+                        send_prompt_result(
+                            &result_tx,
+                            &turn_id,
+                            agent,
+                            source,
+                            PromptOutcome::Timeout(TimeoutKind::Hard { recently_active }),
+                            requeue_batch_if_queue(&ctx, batch),
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            target: "pool::session",
+                            "initial_message failed for channel {cid}: {e} — invalidating session"
+                        );
+                        agent.state.invalidate(&source);
+                        send_prompt_result(
+                            &result_tx,
+                            &turn_id,
+                            agent,
+                            source,
+                            PromptOutcome::Error(e),
+                            requeue_batch_if_queue(&ctx, batch),
+                        );
+                        return;
+                    }
+                }
             }
         }
-    }
+        break (session_id, standing, standing_context_sent);
+    };
     // Any `initial_message` setup turn is done; see `prompt_is_dm`.
     prompt_routing.record_dm(prompt_is_dm);
 
@@ -3435,16 +3774,29 @@ pub async fn run_prompt_task(
     );
 
     // Keep the same control path during the post check and continuation.
+    let mut completed = None;
+    let scheduled = batch
+        .as_ref()
+        .is_some_and(FlushBatch::is_scheduled_workflow_turn);
     let prompt = async {
+        if !agent.admits_turn(&ctx) {
+            return Err(AcpError::AdmissionClosed);
+        }
         let stop_reason = agent
             .acp
             .session_prompt_blocks_with_idle_timeout(
                 &session_id,
                 &prompt_blocks,
                 ctx.idle_timeout,
-                ctx.max_turn_duration,
+                max_duration,
             )
             .await?;
+        let turn = agent.record_completed_prompt(&ctx, &source, &session_id, scheduled);
+        let reduce_before_next_prompt = turn.reduction != Reduction::None;
+        completed = Some(turn);
+        if reduce_before_next_prompt || !agent.admits_turn(&ctx) {
+            return Ok(stop_reason);
+        }
         enforce_silent_turn_continuation(
             &mut agent,
             &session_id,
@@ -3453,6 +3805,7 @@ pub async fn run_prompt_task(
             turn_watermark,
             &turn_id,
             stop_reason,
+            &mut completed,
         )
         .await
     };
@@ -3489,11 +3842,11 @@ pub async fn run_prompt_task(
                         {
                             Ok(stop_reason) => {
                                 log_stop_reason(&source, &stop_reason);
+                                let usage = agent.record_completed_prompt(&ctx, &source, &session_id, scheduled).usage;
                                 agent.state.invalidate(&source);
                                 let retry_batch =
                                     requeue_cancelled_batch(&ctx, control_signal, batch);
 
-                                let usage = agent.acp.take_turn_usage();
                                 publish_agent_turn_metric(
                                     &ctx,
                                     usage,
@@ -3587,12 +3940,19 @@ pub async fn run_prompt_task(
                                 &pending_hydrated_thread_roots,
                             );
                         }
+                        let usage = completed.take().and_then(|turn| {
+                            match turn.reduction {
+                                Reduction::Rotate => agent.state.invalidate(&source),
+                                Reduction::Compact => agent.state.schedule_compaction(&source),
+                                Reduction::None => {}
+                            }
+                            turn.usage
+                        });
                         apply_completed_before_control_signal(
                             &mut agent.state,
                             &source,
                             &control_signal,
                         );
-                        let usage = agent.acp.take_turn_usage();
                         publish_agent_turn_metric(
                             &ctx,
                             usage,
@@ -3619,6 +3979,10 @@ pub async fn run_prompt_task(
 
     match prompt_result {
         Ok(stop_reason) => {
+            let CompletedPrompt { usage, reduction } = completed.unwrap_or(CompletedPrompt {
+                usage: None,
+                reduction: Reduction::None,
+            });
             log_stop_reason(&source, &stop_reason);
 
             if let PromptSource::Channel(scope) = &source {
@@ -3634,13 +3998,19 @@ pub async fn run_prompt_task(
                 agent.state.heartbeat_standing_context_sent = true;
             }
 
-            let should_rotate = matches!(
-                stop_reason,
-                StopReason::MaxTokens | StopReason::MaxTurnRequests
-            );
+            let should_rotate = reduction == Reduction::Rotate
+                || matches!(
+                    stop_reason,
+                    StopReason::MaxTokens | StopReason::MaxTurnRequests
+                );
 
             let should_rotate = should_rotate || {
-                let limit = ctx.max_turns_per_session;
+                let limit = ctx.usage_guard.settings.max_turns(agent.is_claude(), 0);
+                let limit = if limit == 0 {
+                    ctx.max_turns_per_session
+                } else {
+                    0
+                };
                 if limit > 0 {
                     match &source {
                         PromptSource::Channel(scope) => {
@@ -3664,10 +4034,11 @@ pub async fn run_prompt_task(
                     "rotating session for {source:?} after {stop_reason:?}",
                 );
                 agent.state.invalidate(&source);
+            } else if reduction == Reduction::Compact {
+                agent.state.schedule_compaction(&source);
             }
 
             let core_stop = acp_stop_to_core(&stop_reason);
-            let usage = agent.acp.take_turn_usage();
             publish_agent_turn_metric(
                 &ctx,
                 usage,
@@ -3685,6 +4056,16 @@ pub async fn run_prompt_task(
                 source,
                 PromptOutcome::Ok(stop_reason),
                 None,
+            );
+        }
+        Err(AcpError::AdmissionClosed) => {
+            send_prompt_result(
+                &result_tx,
+                &turn_id,
+                agent,
+                source,
+                PromptOutcome::AdmissionBlocked,
+                batch,
             );
         }
         Err(AcpError::AgentExited) => {
@@ -3722,7 +4103,9 @@ pub async fn run_prompt_task(
             {
                 Ok(stop_reason) => {
                     log_stop_reason(&source, &stop_reason);
-                    let usage = agent.acp.take_turn_usage();
+                    let usage = agent
+                        .record_completed_prompt(&ctx, &source, &session_id, scheduled)
+                        .usage;
                     publish_agent_turn_metric(
                         &ctx,
                         usage,
@@ -3801,7 +4184,7 @@ pub async fn run_prompt_task(
             tracing::error!(
                 target: "pool::prompt",
                 "hard timeout ({}s cap, silence {silence:?}, recently_active={recently_active}) — agent process is unrecoverable, invalidating all sessions",
-                ctx.max_turn_duration.as_secs()
+                max_duration.as_secs()
             );
             agent.state.invalidate_all();
             let usage = agent.acp.take_turn_usage();
@@ -7203,6 +7586,7 @@ pub(crate) mod tests {
             scope: SessionScope::Conversation { channel_id },
             events: vec![crate::queue::BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event,
                 prompt_tag: "@mention".into(),
@@ -7508,6 +7892,7 @@ for line in sys.stdin:
             1_000,
             "test-turn",
             StopReason::EndTurn,
+            &mut None,
         )
         .await
         .expect("silent-turn policy");
@@ -7542,6 +7927,7 @@ for line in sys.stdin:
             1_000,
             "test-turn",
             StopReason::EndTurn,
+            &mut None,
         )
         .await
         .expect("relay uncertainty must not fail the ACP turn");
@@ -7697,6 +8083,7 @@ for line in sys.stdin:
             1_000,
             "test-turn",
             StopReason::EndTurn,
+            &mut None,
         )
         .await
         .expect("silent-turn policy");
@@ -7740,6 +8127,7 @@ for line in sys.stdin:
             1_000,
             "test-turn",
             StopReason::EndTurn,
+            &mut None,
         )
         .await
         .expect("silent-turn policy");
@@ -7787,6 +8175,7 @@ for line in sys.stdin:
             1_000,
             "test-turn",
             StopReason::EndTurn,
+            &mut None,
         )
         .await
         .expect("silent-turn policy");
@@ -7812,6 +8201,7 @@ for line in sys.stdin:
             1_000,
             "test-turn",
             StopReason::EndTurn,
+            &mut None,
         )
         .await
         .expect("silent-turn policy");
@@ -7982,6 +8372,7 @@ done"#
                 scope: SessionScope::Conversation { channel_id },
                 events: vec![crate::queue::BatchEvent {
                     answer_required: None,
+                    scheduled_workflow: false,
                     edit: None,
                     event,
                     prompt_tag: "test".into(),
@@ -8184,6 +8575,7 @@ done"#
             scope: scope.clone(),
             events: vec![crate::queue::BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event: root,
                 prompt_tag: "@mention".into(),
@@ -8197,6 +8589,7 @@ done"#
             scope: scope.clone(),
             events: vec![crate::queue::BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event: trigger,
                 prompt_tag: "@mention".into(),
@@ -8291,6 +8684,7 @@ done"#
             scope: SessionScope::Conversation { channel_id },
             events: vec![crate::queue::BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event: new_event.clone(),
                 prompt_tag: "test".into(),
@@ -8298,6 +8692,7 @@ done"#
             }],
             cancelled_events: vec![crate::queue::BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event: carry_over.clone(),
                 prompt_tag: "test".into(),
@@ -8310,6 +8705,7 @@ done"#
             scope: SessionScope::Conversation { channel_id },
             events: vec![crate::queue::BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event: next_event,
                 prompt_tag: "test".into(),
@@ -8469,6 +8865,7 @@ done"#
             scope: SessionScope::Conversation { channel_id },
             events: vec![crate::queue::BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event: trigger,
                 prompt_tag: "test".into(),
@@ -8543,7 +8940,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             "live-session".into(),
         ));
         let agent = pool
-            .try_claim(Some(&conv(channel_id)))
+            .try_claim(Some(&conv(channel_id)), |_| true)
             .expect("claim returned agent");
 
         let mut ctx = make_prompt_context_no_owner();
@@ -8754,6 +9151,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             },
             events: vec![crate::queue::BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event: trigger,
                 prompt_tag: "@mention".into(),
@@ -8809,6 +9207,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             scope: SessionScope::Conversation { channel_id },
             events: vec![crate::queue::BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event: trigger,
                 prompt_tag: "@mention".into(),
@@ -9051,6 +9450,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             scope,
             events: vec![crate::queue::BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -9135,6 +9535,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         let mut batch = batch_with_scope(conv(channel), current);
         batch.cancelled_events.push(crate::queue::BatchEvent {
             answer_required: None,
+            scheduled_workflow: false,
             edit: None,
             event: cancelled,
             prompt_tag: "cancelled".into(),
@@ -9294,6 +9695,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             abort.id(),
             TaskMeta {
                 agent_index,
+                claude: false,
                 channel_id: Some(busy_scope.channel_id()),
                 scope: Some(busy_scope),
                 turn_id: "t".into(),
@@ -9564,7 +9966,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         let replacement = idle_agent_with_session(1, busy_scope.clone()).await;
         let mut pool = AgentPool::from_slots(vec![Some(old_owner), Some(replacement)]);
 
-        let mut old_owner = pool.try_claim(None).expect("claim worker 0");
+        let mut old_owner = pool.try_claim(None, |_| true).expect("claim worker 0");
         let old_generation = pool.record_scope_owner(scope.clone(), old_owner.index);
         old_owner
             .state
@@ -9586,7 +9988,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         ));
 
         let mut replacement = pool
-            .try_claim(Some(&scope))
+            .try_claim(Some(&scope), |_| true)
             .expect("idle worker receives forked scope");
         pool.clear_hold(&scope);
         assert_eq!(replacement.index, 1);
@@ -9616,7 +10018,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         );
 
         let claimed = pool
-            .try_claim(Some(&scope))
+            .try_claim(Some(&scope), |_| true)
             .expect("authoritative owner remains claimable");
         assert_eq!(claimed.index, 1, "next turn resumes the forked session");
     }
@@ -9819,6 +10221,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             scope: SessionScope::Conversation { channel_id },
             events: vec![crate::queue::BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -9888,6 +10291,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             PromptOutcome::CancelDrainTimeout(_) => "CancelDrainTimeout",
             PromptOutcome::Error(_) => "Error",
             PromptOutcome::ProjectContextIndeterminate(_) => "ProjectContextIndeterminate",
+            PromptOutcome::AdmissionBlocked => "AdmissionBlocked",
             PromptOutcome::Cancelled => "Cancelled",
             PromptOutcome::Ok(_) => "Ok",
         };
@@ -10503,6 +10907,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             abort.id(),
             TaskMeta {
                 agent_index: 0,
+                claude: false,
                 channel_id: Some(scope.channel_id()),
                 scope: Some(scope),
                 turn_id: "t".into(),
@@ -11115,6 +11520,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             ),
             context_message_limit: 0,
             max_turns_per_session: 0,
+            usage_guard: Default::default(),
             permission_mode: PermissionMode::Default,
             agent_keys: agent_keys.clone(),
             agent_owner_pubkey: owner_pubkey,
@@ -11498,7 +11904,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
     /// HTTP server, plus a counter of the requests that actually reached it.
     /// Counting real requests is the point: the composition tests are pure and
     /// cannot see duplicated I/O.
-    async fn counting_resolver(
+    pub(super) async fn counting_resolver(
         response: serde_json::Value,
     ) -> (
         ChannelInfoResolver,
@@ -11762,6 +12168,7 @@ done"#
             scope: conv(channel_id),
             events: vec![crate::queue::BatchEvent {
                 answer_required: None,
+                scheduled_workflow: false,
                 edit: None,
                 event,
                 prompt_tag: "test".into(),
@@ -13088,3 +13495,7 @@ mod pi_prompt_tests;
 #[cfg(test)]
 #[path = "pool/abandoned_session_tests.rs"]
 mod abandoned_session_tests;
+
+#[cfg(test)]
+#[path = "pool/usage_guard_tests.rs"]
+mod usage_guard_tests;

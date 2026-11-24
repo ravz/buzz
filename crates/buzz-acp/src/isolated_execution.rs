@@ -20,7 +20,22 @@ pub(crate) async fn execute(
     if !matches!(cancel.try_recv(), Err(oneshot::error::TryRecvError::Empty)) {
         return Outcome::Cancelled;
     }
-    let deadline = tokio::time::Instant::now() + duration;
+    let startup_delay = ctx
+        .usage_guard
+        .settings
+        .startup_delay(&ctx.agent_keys.public_key());
+    if !startup_delay.is_zero() {
+        tokio::select! {
+            biased;
+            _ = &mut cancel => return Outcome::Cancelled,
+            _ = tokio::time::sleep(startup_delay) => {},
+        }
+    }
+    let started = tokio::time::Instant::now();
+    let deadline = started
+        + duration.min(ctx.max_turn_duration.max(Duration::from_secs(
+            ctx.usage_guard.settings.claude_max_duration_secs,
+        )));
     let mut acp = match AcpClient::spawn(
         &startup.command,
         &startup.args,
@@ -59,6 +74,8 @@ pub(crate) async fn execute(
         goose_system_prompt_supported: None,
         protocol_version: init["protocolVersion"].as_u64().unwrap_or(1) as u32,
     };
+    let duration = duration.min(ctx.prompt_duration(&agent));
+    let deadline = started + duration;
     let mut session = None;
     let outcome = tokio::select! {
         biased;
@@ -73,6 +90,7 @@ pub(crate) async fn execute(
                 Ok(acp::StopReason::Refusal) => Outcome::Completed("refusal".into()),
                 Err(acp::AcpError::HardTimeout { .. }) => Outcome::Deadline,
                 Err(acp::AcpError::IdleTimeout(_)) => Outcome::Failed("agent_idle_timeout"),
+                Err(acp::AcpError::AdmissionClosed) => Outcome::Failed("agent_admission_closed"),
                 Err(_) => Outcome::Failed("agent_execution_failed"),
             }
         }
