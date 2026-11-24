@@ -2350,6 +2350,27 @@ struct RespawnResult {
     result: Result<(AcpClient, u32, String)>,
 }
 
+impl RespawnResult {
+    fn into_agent(self, config: &Config) -> Result<OwnedAgent> {
+        let (acp, protocol_version, agent_name) = self.result?;
+        Ok(OwnedAgent {
+            index: self.index,
+            acp,
+            // Session IDs and pending closes belong to the old subprocess.
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: config.model.clone(),
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: config.effort_level.clone(),
+            agent_name,
+            goose_system_prompt_supported: None,
+            protocol_version,
+        })
+    }
+}
+
 /// Outcome of a non-cancelling steer attempt, forwarded from a per-attempt
 /// watcher task (which awaits the `SteerRequest.ack_tx` oneshot) back to
 /// the main loop's `select!`. The main loop drives queue side-effects from
@@ -3974,30 +3995,17 @@ async fn run_harness(
             Some(PoolEvent::Recovery(wake)) => {
                 match wake {
                     recovery_wake::RecoveryWake::Respawn(rr) => {
-                        crash_history[rr.index].respawn_in_flight = false;
-                        match rr.result {
-                            Ok((acp, protocol_version, agent_name)) => {
-                                let agent = OwnedAgent {
-                                    index: rr.index,
-                                    acp,
-                                    state: SessionState::default(),
-                                    model_capabilities: None,
-                                    desired_model: config.model.clone(),
-                                    model_overridden: false,
-                                    desired_model_request_id: None,
-                                    desired_model_pending_ack: false,
-                                    startup_effort: config.effort_level.clone(),
-                                    agent_name,
-                                    goose_system_prompt_supported: None,
-                                    protocol_version,
-                                };
+                        let index = rr.index;
+                        crash_history[index].respawn_in_flight = false;
+                        match rr.into_agent(config) {
+                            Ok(agent) => {
                                 pool.return_agent(agent);
-                                tracing::info!(agent = rr.index, "respawn complete");
+                                tracing::info!(agent = index, "respawn complete");
                             }
                             Err(e) => {
-                                crash_history[rr.index].mark_spawn_failed();
+                                crash_history[index].mark_spawn_failed();
                                 tracing::warn!(
-                                    agent = rr.index,
+                                    agent = index,
                                     "respawn failed: {e} — circuit re-opened"
                                 );
                             }
@@ -5103,7 +5111,12 @@ fn dispatch_pending(
         }
         tracing::debug!(agent = agent.index, channel = %channel_id, scope = %scope.telemetry_label(), affinity_hit, "agent_claimed");
 
-        if let Some(budget) = ctx.silent_turn_budget(&batch) {
+        let close_budget = agent.abandoned_session_close_budget();
+        let silent_turn_budget = ctx.silent_turn_budget(&batch);
+        if !close_budget.is_zero() || silent_turn_budget.is_some() {
+            let budget = silent_turn_budget
+                .unwrap_or(ctx.max_turn_duration)
+                .saturating_add(close_budget);
             queue.extend_in_flight_deadline(&scope, budget.as_secs());
         }
         let recoverable_batch = match ctx.dedup_mode {
@@ -5313,7 +5326,12 @@ fn handle_prompt_result(
         // The task may have invalidated this session before returning. Never
         // resurrect delivery state for a dead session; its replacement must
         // receive fresh standing context and history.
-        if let Some(live_session_id) = result.agent.state.sessions.get(scope).cloned() {
+        if let Some(live_session_id) = result
+            .agent
+            .state
+            .scope_session_id(scope)
+            .map(str::to_owned)
+        {
             let event_ids = successful_steer_deliveries
                 .into_iter()
                 .filter(|delivery| delivery.session_id == live_session_id)
@@ -10971,8 +10989,7 @@ mod edit_native_steer_tests {
         if matches!(hold_at, HoldAt::Prompt) {
             agent
                 .state
-                .sessions
-                .insert(scope.clone(), "live-session".into());
+                .install_scope_session(scope.clone(), "live-session".into());
         }
         // The relay has no newer metadata, project, or history: every query
         // except a profile lookup returns no events, so the turn keeps the
@@ -11511,7 +11528,7 @@ mod error_outcome_emission_tests {
         let channel_id = Uuid::new_v4();
         let steer_event_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let mut agent = dummy_agent(0).await;
-        agent.state.sessions.insert(
+        agent.state.install_scope_session(
             scope::SessionScope::Conversation { channel_id },
             "live-session".into(),
         );
@@ -11592,7 +11609,7 @@ mod error_outcome_emission_tests {
     async fn in_flight_stale_native_steer_ack_cannot_update_replacement_session() {
         let channel_id = Uuid::new_v4();
         let mut agent = dummy_agent(0).await;
-        agent.state.sessions.insert(
+        agent.state.install_scope_session(
             scope::SessionScope::Conversation { channel_id },
             "replacement-session".into(),
         );
@@ -11674,7 +11691,7 @@ mod error_outcome_emission_tests {
         let channel_id = Uuid::new_v4();
         let steer_event_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let mut agent = dummy_agent(0).await;
-        agent.state.sessions.insert(
+        agent.state.install_scope_session(
             scope::SessionScope::Conversation { channel_id },
             "live-session".into(),
         );
@@ -11701,7 +11718,7 @@ mod error_outcome_emission_tests {
     async fn late_native_steer_ack_cannot_update_replacement_session() {
         let channel_id = Uuid::new_v4();
         let mut agent = dummy_agent(0).await;
-        agent.state.sessions.insert(
+        agent.state.install_scope_session(
             scope::SessionScope::Conversation { channel_id },
             "replacement-session".into(),
         );
@@ -12867,8 +12884,7 @@ mod error_outcome_emission_tests {
         let mut agent = dummy_agent(0).await;
         agent
             .state
-            .sessions
-            .insert(session_scope.clone(), "healthy-session".into());
+            .install_scope_session(session_scope.clone(), "healthy-session".into());
         let mut pool = AgentPool::from_slots(vec![None]);
         bind_agent_scope_owner(&mut pool, &mut agent, session_scope.clone());
         let task_id = pool.join_set.spawn(async {}).id();
@@ -12928,11 +12944,7 @@ mod error_outcome_emission_tests {
             .as_ref()
             .expect("healthy agent returns to its slot");
         assert_eq!(
-            returned
-                .state
-                .sessions
-                .get(&session_scope)
-                .map(String::as_str),
+            returned.state.scope_session_id(&session_scope),
             Some("healthy-session")
         );
         assert_eq!(queue.queued_event_count(channel_id), 1);

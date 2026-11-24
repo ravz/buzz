@@ -32,7 +32,7 @@ use uuid::Uuid;
 use crate::acp::{
     extract_model_config_options, extract_model_state, extract_thought_level_config_id,
     model_in_catalog, resolve_model_switch_method, AcpClient, AcpError, EnvVar, McpServer,
-    ModelSwitchMethod, StopReason, SystemPromptTransport, BUZZ_PI_ACP_NAME,
+    ModelSwitchMethod, SessionNewResponse, StopReason, SystemPromptTransport, BUZZ_PI_ACP_NAME,
 };
 use crate::config::{compose_scoped_session_title, DedupMode, PermissionMode};
 use crate::observer;
@@ -47,6 +47,8 @@ use crate::scope::SessionScope;
 /// Window within which agent activity before a hard-cap death qualifies
 /// the turn as "recently active" (eligible for requeue instead of dead-letter).
 const RECENT_ACTIVITY_WINDOW: Duration = Duration::from_secs(60);
+
+const SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 const SILENT_TURN_CONTINUATION_PROMPT: &str =
     "[Harness-generated continuation — not a user message]\n\
@@ -137,8 +139,10 @@ pub struct ChannelDeliveryState {
 #[derive(Default)]
 pub struct SessionState {
     /// session scope → session_id
-    pub sessions: HashMap<SessionScope, String>,
-    pub heartbeat_session: Option<String>,
+    sessions: HashMap<SessionScope, String>,
+    heartbeat_session: Option<String>,
+    /// Deduplicated close requests for this adapter process.
+    pending_close: HashSet<String>,
     /// Per-scope turn counters for proactive session rotation.
     /// Incremented on each successful prompt; reset when the session is rotated.
     pub turn_counts: HashMap<SessionScope, u32>,
@@ -167,6 +171,32 @@ pub struct SessionState {
 }
 
 impl SessionState {
+    pub(crate) fn scope_session_id(&self, scope: &SessionScope) -> Option<&str> {
+        self.sessions.get(scope).map(String::as_str)
+    }
+
+    pub(crate) fn install_scope_session(&mut self, scope: SessionScope, session_id: String) {
+        self.pending_close.remove(&session_id);
+        if let Some(old_id) = self.sessions.insert(scope, session_id) {
+            self.enqueue_close(old_id);
+        }
+    }
+
+    fn install_heartbeat_session(&mut self, session_id: String) {
+        self.pending_close.remove(&session_id);
+        if let Some(old_id) = self.heartbeat_session.replace(session_id) {
+            self.enqueue_close(old_id);
+        }
+    }
+
+    fn enqueue_close(&mut self, session_id: String) {
+        if self.heartbeat_session.as_ref() != Some(&session_id)
+            && !self.sessions.values().any(|live| live == &session_id)
+        {
+            self.pending_close.insert(session_id);
+        }
+    }
+
     pub(crate) fn set_scope_owner_generation(&mut self, scope: SessionScope, generation: u64) {
         self.scope_owner_generations.insert(scope, generation);
     }
@@ -178,7 +208,9 @@ impl SessionState {
                 self.invalidate_scope(scope);
             }
             PromptSource::Heartbeat => {
-                self.heartbeat_session = None;
+                if let Some(session_id) = self.heartbeat_session.take() {
+                    self.enqueue_close(session_id);
+                }
                 self.heartbeat_turn_count = 0;
                 self.heartbeat_standing_context_sent = false;
             }
@@ -193,7 +225,11 @@ impl SessionState {
         self.canvas_sections.remove(scope);
         self.deliveries.remove(scope);
         self.scope_owner_generations.remove(scope);
-        self.sessions.remove(scope).is_some()
+        let Some(session_id) = self.sessions.remove(scope) else {
+            return false;
+        };
+        self.enqueue_close(session_id);
+        true
     }
 
     /// Invalidate every session scope belonging to `channel_id` (channel-wide
@@ -224,9 +260,11 @@ impl SessionState {
 
     /// Invalidate all sessions and turn counters (e.g. after agent exit).
     pub fn invalidate_all(&mut self) {
-        self.sessions.clear();
+        // All sessions are being retired, so none of these IDs can stay live.
+        self.pending_close
+            .extend(self.sessions.drain().map(|(_, id)| id));
+        self.pending_close.extend(self.heartbeat_session.take());
         self.turn_counts.clear();
-        self.heartbeat_session = None;
         self.heartbeat_turn_count = 0;
         self.heartbeat_standing_context_sent = false;
         self.core_sections.clear();
@@ -354,6 +392,19 @@ fn session_new_system_prompt<'a>(
 }
 
 impl OwnedAgent {
+    /// Budget the pre-turn drain when setting the queue's in-flight deadline.
+    pub(crate) fn abandoned_session_close_budget(&self) -> Duration {
+        if self.acp.session_close_supported() {
+            Duration::from_secs(
+                SESSION_CLOSE_TIMEOUT
+                    .as_secs()
+                    .saturating_mul(self.state.pending_close.len() as u64),
+            )
+        } else {
+            Duration::ZERO
+        }
+    }
+
     pub(crate) fn has_system_prompt_support(&self) -> bool {
         has_system_prompt_support(
             self.protocol_version,
@@ -1661,8 +1712,31 @@ async fn create_session_and_apply_model(
         )
         .await?;
 
+    if let Err(error) = configure_new_session(
+        agent,
+        ctx,
+        &resp,
+        is_goose,
+        combined_system_prompt.as_deref(),
+    )
+    .await
+    {
+        // session/new succeeded, but this ID never became a live session.
+        agent.state.enqueue_close(resp.session_id);
+        return Err(error);
+    }
+    Ok(resp.session_id)
+}
+
+async fn configure_new_session(
+    agent: &mut OwnedAgent,
+    ctx: &PromptContext,
+    resp: &SessionNewResponse,
+    is_goose: bool,
+    combined_system_prompt: Option<&str>,
+) -> Result<(), AcpError> {
     if is_goose && agent.goose_system_prompt_supported != Some(false) {
-        if let Some(prompt) = combined_system_prompt.as_deref() {
+        if let Some(prompt) = combined_system_prompt {
             match agent
                 .acp
                 .session_set_goose_system_prompt(&resp.session_id, prompt)
@@ -1865,7 +1939,7 @@ async fn create_session_and_apply_model(
         apply_permission_mode(&mut agent.acp, &resp.session_id, &ctx.permission_mode).await?;
     }
 
-    Ok(resp.session_id)
+    Ok(())
 }
 
 /// Run a prepared task with the normal session setup and standing instructions.
@@ -2422,6 +2496,30 @@ fn send_prompt_result(
     });
 }
 
+/// Drain this subprocess's abandoned sessions before starting another turn.
+async fn close_abandoned_sessions(agent: &mut OwnedAgent) {
+    let pending_close = std::mem::take(&mut agent.state.pending_close);
+    if !agent.acp.session_close_supported() {
+        return;
+    }
+
+    for session_id in pending_close {
+        let result = timeout(SESSION_CLOSE_TIMEOUT, agent.acp.session_close(&session_id))
+            .await
+            .unwrap_or(Err(AcpError::Timeout(SESSION_CLOSE_TIMEOUT)));
+        match result {
+            Ok(()) => tracing::info!(
+                target: "pool::session", agent = agent.index, %session_id,
+                "closed abandoned session"
+            ),
+            Err(error) => tracing::warn!(
+                target: "pool::session", agent = agent.index, %session_id, %error,
+                "failed to close abandoned session"
+            ),
+        }
+    }
+}
+
 /// Apply the bounded silent-turn policy to a normal ACP completion. A relay
 /// error leaves the post status unknown and preserves the original result.
 async fn enforce_silent_turn_continuation(
@@ -2610,6 +2708,8 @@ pub async fn run_prompt_task(
     );
     let liveness_handle = tokio::spawn(liveness);
     let liveness_guard = LivenessGuard::new(liveness_handle, liveness_state);
+
+    close_abandoned_sessions(&mut agent).await;
 
     // Collects event IDs up front. On drop (any exit path — normal, early
     // return, or panic), spawns best-effort cleanup of both 👀 and 💬.
@@ -2821,7 +2921,9 @@ pub async fn run_prompt_task(
                             "created session {sid} for channel {cid} (scope {})",
                             scope.telemetry_label()
                         );
-                        agent.state.sessions.insert(scope.clone(), sid.clone());
+                        agent
+                            .state
+                            .install_scope_session(scope.clone(), sid.clone());
                         agent
                             .state
                             .deliveries
@@ -2887,7 +2989,7 @@ pub async fn run_prompt_task(
                             "created heartbeat session {sid} for agent {}",
                             agent.index
                         );
-                        agent.state.heartbeat_session = Some(sid.clone());
+                        agent.state.install_heartbeat_session(sid.clone());
                         // Seed a zero usage baseline: buzz-acp spawned this session.
                         agent.acp.notify_session_spawned(&sid);
                         (sid, true)
@@ -12982,3 +13084,7 @@ done"#
 #[cfg(all(test, unix))]
 #[path = "pool/pi_prompt_tests.rs"]
 mod pi_prompt_tests;
+
+#[cfg(test)]
+#[path = "pool/abandoned_session_tests.rs"]
+mod abandoned_session_tests;

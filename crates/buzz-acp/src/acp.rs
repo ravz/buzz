@@ -207,6 +207,8 @@ pub struct AcpClient {
     /// a JSON-RPC *success*, not `-32601` — which the main loop would read as
     /// a delivered steer and drop the user's message from the queue.
     steering_supported: bool,
+    /// Close support advertised by this subprocess at initialize.
+    session_close_supported: bool,
     /// Per-turn channel for receiving goose-native non-cancelling steer
     /// requests from the main loop. Installed by
     /// [`install_steer_rx`](Self::install_steer_rx) at dispatch and
@@ -629,6 +631,7 @@ impl AcpClient {
             observer_context: ObserverContext::default(),
             active_run_id: None,
             steering_supported: false,
+            session_close_supported: false,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
             standard_usage: StandardUsageTracker::default(),
@@ -692,6 +695,9 @@ impl AcpClient {
             .pointer("/_meta/steering/supported")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        self.session_close_supported = result
+            .pointer("/agentCapabilities/sessionCapabilities/close")
+            .is_some_and(|capability| capability.is_object() || capability.as_bool() == Some(true));
         tracing::debug!(target: "acp::init", "initialize response: {result}");
         Ok(result)
     }
@@ -937,6 +943,21 @@ impl AcpClient {
             "sessionId": session_id,
         });
         self.send_notification("session/cancel", params).await
+    }
+
+    /// Whether this adapter advertised `session/close` at initialize.
+    pub(crate) fn session_close_supported(&self) -> bool {
+        self.session_close_supported
+    }
+
+    /// Ask the adapter to release the resources for an abandoned session.
+    pub(crate) async fn session_close(&mut self, session_id: &str) -> Result<(), AcpError> {
+        self.send_request(
+            "session/close",
+            serde_json::json!({ "sessionId": session_id }),
+        )
+        .await?;
+        Ok(())
     }
 
     /// Returns `true` if a `session/prompt` request is currently in flight.
